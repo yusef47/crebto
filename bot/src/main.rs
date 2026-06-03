@@ -76,7 +76,8 @@ async fn main() -> Result<(), eyre::Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("╔══════════════════════════════════════════════╗");
-    info!("║    🚀 Starting Crebto Arbitrage Bot v0.1    ║");
+    // Crebto main entrypoint
+    info!("Starting Crebto Arbitrage Bot...");
     info!("╚══════════════════════════════════════════════╝");
 
     // 2. Load Configuration

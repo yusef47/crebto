@@ -3,7 +3,9 @@ name: Build Rust Binary
 on:
   push:
     branches: [main]
-    paths: ['bot/**']
+    paths:
+      - 'bot/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 jobs:
