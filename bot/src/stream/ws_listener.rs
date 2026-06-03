@@ -38,7 +38,7 @@ impl WsListener {
                 Ok(sub) => {
                     let mut stream = sub.into_stream();
                     while let Some(block) = stream.next().await {
-                        let block_number = block.header.number.unwrap_or(0);
+                        let block_number = block.header.number;
                         if block_number > 0 {
                             if let Err(e) = block_tx_clone.send(block_number).await {
                                 error!("Failed to send block number: {:?}", e);
