@@ -1,0 +1,38 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use alloy::providers::Provider;
+use alloy::primitives::Address;
+use tracing::info;
+use std::sync::Arc;
+
+pub struct NonceManager {
+    nonce: AtomicU64,
+}
+
+impl NonceManager {
+    pub fn new(initial_nonce: u64) -> Self {
+        Self {
+            nonce: AtomicU64::new(initial_nonce),
+        }
+    }
+
+    /// Fetches initial nonce from the blockchain
+    pub async fn initialize<P: Provider<T>, T: alloy::pubsub::PubSubFrontend>(
+        provider: &Arc<P>,
+        address: Address,
+    ) -> Result<Self, eyre::Report> {
+        let chain_nonce = provider.get_transaction_count(address).await?;
+        info!("Initialized Nonce Manager with chain nonce: {}", chain_nonce);
+        Ok(Self::new(chain_nonce))
+    }
+
+    /// Returns the current nonce and increments the local counter
+    pub fn next_nonce(&self) -> u64 {
+        self.nonce.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Resets the local nonce counter to a specific value (e.g. after transaction reverts/mempool cleared)
+    pub fn reset(&self, new_nonce: u64) {
+        self.nonce.store(new_nonce, Ordering::SeqCst);
+        info!("Reset local nonce to: {}", new_nonce);
+    }
+}

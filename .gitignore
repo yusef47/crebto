@@ -1,0 +1,19 @@
+# Sensitive data
+.env
+*.env
+private_key.txt
+
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Solidity / Foundry build artifacts
+out/
+cache/
+lib/forge-std/
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
