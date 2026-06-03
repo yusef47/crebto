@@ -62,7 +62,7 @@ impl PathFinder {
 
     fn determine_dex_type(pool: &PoolState) -> String {
         // Mock classification based on address or properties
-        if pool.sqrt_price_x96 > crate::alloy::primitives::U256::ZERO {
+        if pool.sqrt_price_x96 > alloy::primitives::U256::ZERO {
             "uniswap_v3".to_string()
         } else {
             "aerodrome".to_string()

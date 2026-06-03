@@ -66,8 +66,7 @@ impl TxBuilder {
         Bytes::from(call.abi_encode())
     }
 
-    /// Sends the signed transaction to Base
-    pub async fn send_transaction<P: Provider<T>, T: PubSubFrontend>(
+    pub async fn send_transaction<P: Provider<PubSubFrontend>>(
         &self,
         provider: &Arc<P>,
         nonce_manager: &NonceManager,

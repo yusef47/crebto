@@ -15,8 +15,7 @@ impl NonceManager {
         }
     }
 
-    /// Fetches initial nonce from the blockchain
-    pub async fn initialize<P: Provider<T>, T: alloy::pubsub::PubSubFrontend>(
+    pub async fn initialize<P: Provider<alloy::pubsub::PubSubFrontend>>(
         provider: &Arc<P>,
         address: Address,
     ) -> Result<Self, eyre::Report> {

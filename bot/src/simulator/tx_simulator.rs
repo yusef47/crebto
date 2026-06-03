@@ -1,8 +1,8 @@
 use alloy::primitives::{Address, Bytes, U256, B256};
 use revm::{
     db::{CacheDB, EmptyDB},
-    primitives::{AccountInfo, Bytecode, ExecutionResult, TransactTo, TxEnv},
-    EVM,
+    primitives::{AccountInfo, Bytecode, ExecutionResult, TransactTo},
+    Evm,
 };
 use eyre::{Result, eyre};
 use std::str::FromStr;
@@ -46,19 +46,18 @@ impl TxSimulator {
         gas_limit: u64,
         gas_price: U256,
     ) -> Result<(bool, u64, U256)> {
-        let mut evm = EVM::new();
-        evm.database(&mut self.db);
-
-        // Setup the transaction environment
-        let mut tx = TxEnv::default();
-        tx.caller = caller;
-        tx.transact_to = TransactTo::Call(contract_address);
-        tx.data = call_data.into();
-        tx.gas_limit = gas_limit;
-        tx.gas_price = gas_price;
-        tx.value = U256::ZERO;
-
-        evm.env.tx = tx;
+        // Setup the transaction environment using revm 9.0 builder
+        let mut evm = Evm::builder()
+            .with_db(&mut self.db)
+            .modify_tx_env(|tx| {
+                tx.caller = caller;
+                tx.transact_to = TransactTo::Call(contract_address);
+                tx.data = call_data.clone().into();
+                tx.gas_limit = gas_limit;
+                tx.gas_price = gas_price;
+                tx.value = U256::ZERO;
+            })
+            .build();
 
         // Run transaction
         let ref_tx = evm.transact()?;
