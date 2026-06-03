@@ -69,9 +69,10 @@ impl BotStats {
 
 #[tokio::main]
 async fn main() -> Result<(), eyre::Report> {
-    // 1. Initialize Logging
+    // 1. Initialize Logging to Stderr (unbuffered for real-time logs in Kaggle)
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 

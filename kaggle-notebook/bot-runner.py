@@ -2,6 +2,7 @@ import os
 import subprocess
 import urllib.request
 import json
+import sys
 
 def get_latest_binary_info(github_token):
     try:
@@ -104,13 +105,34 @@ def run():
     os.chmod("/tmp/crebto-bot", 0o755)
     print("✅ Binary downloaded and permissions set.")
 
-    # 4. Launch the bot
+    # 4. Launch the bot and stream logs in real-time
     print("🚀 Launching bot...")
     try:
-        # Run for ~11.5 hours (41400 seconds)
-        subprocess.run(["/tmp/crebto-bot"], env=env, timeout=41400)
+        # Popen allows us to read stdout/stderr in real-time without buffering
+        process = subprocess.Popen(
+            ["/tmp/crebto-bot"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+        
+        # Read from stdout line by line and flush immediately
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                print(line.strip(), flush=True)
+                
+        # Wait for process to exit or timeout after ~11.5 hours
+        process.wait(timeout=41400)
+        print("⏳ Bot execution session finished.")
+        
     except subprocess.TimeoutExpired:
-        print("⏳ Bot session timeout reached (11.5 hours). Exiting for restart.")
+        print("⏳ Bot session timeout reached (11.5 hours). Terminating.")
+        process.terminate()
     except Exception as e:
         print(f"❌ Bot execution failed: {e}")
 
