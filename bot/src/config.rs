@@ -5,8 +5,10 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub alchemy_wss: String,
-    pub private_key: String,
-    pub contract_address: Address,
+    pub alchemy_http: String,
+    pub dry_run: bool,
+    pub private_key: Option<String>,
+    pub contract_address: Option<Address>,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub max_gas_price_gwei: u64,
@@ -20,16 +22,24 @@ impl Config {
         // Load .env file if it exists (local dev)
         let _ = dotenvy::dotenv();
 
+        // DRY_RUN mode: if true, bot will only monitor and simulate, never send real TXs
+        let dry_run = env::var("DRY_RUN")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
         let alchemy_wss = env::var("ALCHEMY_WSS")
             .map_err(|_| eyre::eyre!("ALCHEMY_WSS must be set in environment"))?;
-            
-        let private_key = env::var("PRIVATE_KEY")
-            .map_err(|_| eyre::eyre!("PRIVATE_KEY must be set in environment"))?;
 
-        let contract_address_str = env::var("CONTRACT_ADDRESS")
-            .map_err(|_| eyre::eyre!("CONTRACT_ADDRESS must be set in environment"))?;
-        let contract_address = Address::from_str(&contract_address_str)
-            .map_err(|_| eyre::eyre!("Invalid CONTRACT_ADDRESS format"))?;
+        let alchemy_http = env::var("ALCHEMY_HTTP")
+            .unwrap_or_else(|_| alchemy_wss.replace("wss://", "https://").replace("/ws/", "/"));
+
+        // In DRY_RUN mode, private key and contract address are optional
+        let private_key = env::var("PRIVATE_KEY").ok();
+        
+        let contract_address = env::var("CONTRACT_ADDRESS")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
 
         let telegram_bot_token = env::var("TELEGRAM_BOT_TOKEN").ok();
         let telegram_chat_id = env::var("TELEGRAM_CHAT_ID").ok();
@@ -50,12 +60,14 @@ impl Config {
             .unwrap_or(5.0);
 
         let max_consecutive_failures = env::var("MAX_CONSECUTIVE_FAILURES")
-            .unwrap_or_else(|_| "5".to_string())
+            .unwrap_or_else(|_| "50".to_string())
             .parse::<u32>()
-            .unwrap_or(5);
+            .unwrap_or(50);
 
         Ok(Self {
             alchemy_wss,
+            alchemy_http,
+            dry_run,
             private_key,
             contract_address,
             telegram_bot_token,
