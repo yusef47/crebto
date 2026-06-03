@@ -1,0 +1,32 @@
+name: Restart Kaggle Bot
+
+on:
+  schedule:
+    - cron: '50 */12 * * *'  # Runs every 12 hours at minute 50 (~11h 50m intervals)
+  workflow_dispatch:          # Allows manual trigger
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Restart Kaggle Notebook
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          # If kaggle-notebook folder exists with metadata, push to run
+          if [ -d "./kaggle-notebook" ]; then
+            kaggle kernels push -p ./kaggle-notebook/
+          else
+            echo "Kaggle notebook directory not found."
+          fi
