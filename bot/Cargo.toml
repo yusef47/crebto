@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # Ethereum interaction
-alloy = { version = "0.3.0", features = ["full", "ws", "pubsub", "signers", "node-bindings"] }
+alloy = { version = "0.3", features = ["full"] }
 
 # EVM Simulation
 revm = { version = "9.0.0", features = ["ethersdb", "std"] }
