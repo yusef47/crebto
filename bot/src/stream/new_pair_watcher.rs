@@ -5,15 +5,9 @@ use alloy::{
 use eyre::{Result, eyre};
 use tracing::info;
 
-pub const UNISWAP_V3_POOL_CREATED_TOPIC: B256 = B256::from_slice(&[
-    0x78, 0x3d, 0xeb, 0xea, 0xfa, 0x1e, 0x88, 0x05, 0xbd, 0x1b, 0x48, 0x3a, 0x6e, 0x76, 0x51, 0x72,
-    0xf8, 0xee, 0x93, 0xf6, 0x5e, 0x54, 0xdd, 0xdd, 0xa1, 0xef, 0x18, 0x7a, 0x4d, 0x61, 0x94, 0xfa,
-]);
+pub const UNISWAP_V3_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("783debeafa1e8805bd1b483a6e765172f8ee93f65e54dddda1ef187a4d6194fa");
 
-pub const AERODROME_POOL_CREATED_TOPIC: B256 = B256::from_slice(&[
-    0x21, 0x8a, 0x6d, 0x12, 0x8c, 0xdc, 0xd0, 0xae, 0x4e, 0x32, 0x17, 0x10, 0x88, 0x78, 0x1c, 0xcb,
-    0x54, 0x1b, 0xb8, 0xcc, 0x3d, 0x89, 0xc1, 0x75, 0xb2, 0x8d, 0x8c, 0xe1, 0xe2, 0x7e, 0x14, 0x75,
-]);
+pub const AERODROME_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("218a6d128cdcd0ae4e32171088781ccb541bb8cc3d89c175b28d8ce1e27e1475");
 
 #[derive(Debug, Clone)]
 pub struct NewPool {
@@ -48,7 +42,7 @@ impl NewPairWatcher {
             let fee_arr: [u8; 32] = fee_word.into();
             let fee_bps = u32::from_be_bytes([fee_arr[28], fee_arr[29], fee_arr[30], fee_arr[31]]);
 
-            let data = log.data.data.as_ref();
+            let data = log.data().data.as_ref();
             if data.len() < 64 {
                 return Err(eyre!("Data too short for Uniswap PoolCreated"));
             }
@@ -75,7 +69,7 @@ impl NewPairWatcher {
             let token0 = Address::from_word(topics[1]);
             let token1 = Address::from_word(topics[2]);
 
-            let data = log.data.data.as_ref();
+            let data = log.data().data.as_ref();
             if data.len() < 64 {
                 return Err(eyre!("Data too short for Aerodrome PoolCreated"));
             }

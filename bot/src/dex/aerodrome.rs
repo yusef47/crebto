@@ -2,6 +2,7 @@ use crate::dex::traits::{DexQuoter, PoolState};
 use alloy::{
     primitives::{Address, Bytes, U256},
     sol,
+    sol_types::SolCall,
 };
 use eyre::Result;
 

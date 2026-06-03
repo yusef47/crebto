@@ -45,7 +45,7 @@ impl SwapDecoder {
             // data[64..96]:  sqrtPriceX96 (uint160)
             // data[96..128]: liquidity (uint128)
             // data[128..160]: tick (int24)
-            let data = log.data.data.as_ref();
+            let data = log.data().data.as_ref();
             if data.len() < 160 {
                 return Err(eyre!("USV3 log data too short: {}", data.len()));
             }
@@ -99,7 +99,7 @@ impl SwapDecoder {
             // data[32..64]:  amount1In (uint256)
             // data[64..96]:  amount0Out (uint256)
             // data[96..128]: amount1Out (uint256)
-            let data = log.data.data.as_ref();
+            let data = log.data().data.as_ref();
             if data.len() < 128 {
                 return Err(eyre!("Aerodrome log data too short: {}", data.len()));
             }

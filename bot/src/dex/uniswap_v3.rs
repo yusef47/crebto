@@ -2,6 +2,7 @@ use crate::dex::traits::{DexQuoter, PoolState};
 use alloy::{
     primitives::{Address, Bytes, U256},
     sol,
+    sol_types::SolCall,
 };
 use eyre::Result;
 
@@ -62,14 +63,14 @@ impl DexQuoter for UniswapV3Quoter {
             // sqrtPriceX96 = sqrtPrice * 2^96
             // amount_out = amount_in_after_fee * sqrtPriceX96 / 2^96 (roughly)
             let q96 = U256::from(1) << 96;
-            let price = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
+            let price: U256 = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
             let amount_out = (amount_in_after_fee * price) / q96;
             Ok(amount_out)
         } else {
             // Selling token1 for token0 (y for x)
             // amount_out = amount_in_after_fee * 2^96 / sqrtPriceX96 (roughly)
             let q96 = U256::from(1) << 96;
-            let price = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
+            let price: U256 = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
             if price.is_zero() {
                 return Ok(U256::ZERO);
             }
@@ -127,11 +128,11 @@ impl DexQuoter for UniswapV3Quoter {
         let params = ExactInputSingleParams {
             tokenIn: token_in,
             tokenOut: token_out,
-            fee: pool.fee_bps, // e.g. 500, 3000, 10000
+            fee: alloy::primitives::aliases::U24::from(pool.fee_bps), // e.g. 500, 3000, 10000
             recipient,
             amountIn: amount_in,
             amountOutMinimum: min_amount_out,
-            sqrtPriceLimitX96: U256::ZERO,
+            sqrtPriceLimitX96: alloy::primitives::aliases::U160::ZERO,
         };
 
         let call_data = IUniswapV3Router::exactInputSingleCall { params }.abi_encode();

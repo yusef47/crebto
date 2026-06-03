@@ -1,11 +1,12 @@
 use alloy::{
-    network::TransactionBuilder,
+    network::{TransactionBuilder, EthereumWallet},
     primitives::{Address, Bytes, U256},
     providers::Provider,
     pubsub::PubSubFrontend,
     rpc::types::eth::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol,
+    sol_types::SolCall,
 };
 use crate::executor::nonce_manager::NonceManager;
 use eyre::Result;
@@ -66,6 +67,7 @@ impl TxBuilder {
         Bytes::from(call.abi_encode())
     }
 
+    /// Sends the signed transaction to Base
     pub async fn send_transaction<P: Provider<PubSubFrontend>>(
         &self,
         provider: &Arc<P>,
@@ -81,14 +83,15 @@ impl TxBuilder {
             .to(self.contract_address)
             .input(call_data.into())
             .nonce(nonce)
-            .gas_limit(gas_limit)
+            .gas_limit(gas_limit.into())
             .max_fee_per_gas(max_fee_per_gas.to::<u128>())
             .max_priority_fee_per_gas(max_priority_fee_per_gas.to::<u128>());
 
         info!("Sending arbitrage TX with nonce: {}, gas limit: {}", nonce, gas_limit);
 
-        // Sign and send the transaction
-        let tx_envelope = tx.build(&self.signer).await?;
+        // Sign and send the transaction using EthereumWallet
+        let wallet = EthereumWallet::from(self.signer.clone());
+        let tx_envelope = tx.build(&wallet).await?;
         let receipt = provider.send_tx_envelope(tx_envelope).await?;
 
         Ok(*receipt.tx_hash())
