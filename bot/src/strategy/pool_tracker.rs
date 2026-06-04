@@ -43,6 +43,29 @@ fn pair_key(token0: Address, token1: Address) -> (Address, Address) {
     }
 }
 
+/// Helper function to retrieve the decimals of known high-volume tokens on Base
+fn get_token_decimals(token: Address) -> u32 {
+    let weth: Address = "0x4200000000000000000000000000000000000006".parse().unwrap();
+    let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().unwrap();
+    let cbbtc: Address = "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf".parse().unwrap();
+    let usdbc: Address = "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA".parse().unwrap();
+    let dai: Address = "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb".parse().unwrap();
+
+    if token == weth {
+        18
+    } else if token == usdc {
+        6
+    } else if token == cbbtc {
+        8
+    } else if token == usdbc {
+        6
+    } else if token == dai {
+        18
+    } else {
+        18 // Default fallback
+    }
+}
+
 /// Converts sqrtPriceX96 to a floating point price ratio
 fn sqrt_price_to_f64(sqrt_price_x96: U256) -> f64 {
     // sqrtPriceX96 = sqrt(price) * 2^96
@@ -274,6 +297,13 @@ impl PoolTracker {
                     let profit_pct = (spread_bps - min_spread) / 10000.0;
                     let estimated_profit = trade_size_usd * profit_pct;
 
+                    // Convert raw price ratios to human-readable format based on token decimals
+                    let dec0 = get_token_decimals(token0);
+                    let dec1 = get_token_decimals(token1);
+                    let price_multiplier = 10.0_f64.powi(dec0 as i32 - dec1 as i32);
+                    let human_price_a = price_a * price_multiplier;
+                    let human_price_b = price_b * price_multiplier;
+
                     opportunities.push(ArbOpportunity {
                         pool_a: pa.address,
                         pool_b: pb.address,
@@ -281,8 +311,8 @@ impl PoolTracker {
                         dex_b: pb.dex_name.clone(),
                         token0,
                         token1,
-                        price_a,
-                        price_b,
+                        price_a: human_price_a,
+                        price_b: human_price_b,
                         spread_bps,
                         estimated_profit_usd: estimated_profit,
                         gas_cost_usd,
