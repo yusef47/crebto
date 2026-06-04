@@ -1,15 +1,15 @@
 use alloy::{
-    network::{TransactionBuilder, EthereumWallet},
+    network::{TransactionBuilder, Ethereum, EthereumWallet},
     primitives::{Address, Bytes, U256},
     providers::Provider,
     rpc::types::eth::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol,
     sol_types::SolCall,
+    transports::Transport,
 };
 use crate::executor::nonce_manager::NonceManager;
 use eyre::Result;
-use std::sync::Arc;
 use tracing::info;
 
 // Auto-generate ABI encoders from Solidity definitions
@@ -70,15 +70,19 @@ impl TxBuilder {
     }
 
     /// Sends the signed transaction to Base
-    pub async fn send_transaction<P: Provider>(
+    pub async fn send_transaction<T, P>(
         &self,
-        provider: &Arc<P>,
+        provider: &P,
         nonce_manager: &NonceManager,
         call_data: Bytes,
         gas_limit: u64,
         max_fee_per_gas: U256,
         max_priority_fee_per_gas: U256,
-    ) -> Result<alloy::primitives::TxHash> {
+    ) -> Result<alloy::primitives::TxHash>
+    where
+        T: Transport + Clone,
+        P: Provider<T, Ethereum>,
+    {
         let nonce = nonce_manager.next_nonce();
 
         let tx = TransactionRequest::default()

@@ -1,8 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use alloy::providers::Provider;
+use alloy::{
+    network::Ethereum,
+    providers::Provider,
+    transports::Transport,
+};
 use alloy::primitives::Address;
 use tracing::info;
-use std::sync::Arc;
 
 pub struct NonceManager {
     nonce: AtomicU64,
@@ -15,10 +18,14 @@ impl NonceManager {
         }
     }
 
-    pub async fn initialize<P: Provider>(
-        provider: &Arc<P>,
+    pub async fn initialize<T, P>(
+        provider: &P,
         address: Address,
-    ) -> Result<Self, eyre::Report> {
+    ) -> Result<Self, eyre::Report>
+    where
+        T: Transport + Clone,
+        P: Provider<T, Ethereum>,
+    {
         let chain_nonce = provider.get_transaction_count(address).await?;
         info!("Initialized Nonce Manager with chain nonce: {}", chain_nonce);
         Ok(Self::new(chain_nonce))

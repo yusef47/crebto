@@ -18,10 +18,12 @@ use dex::uniswap_v3::UniswapV3Quoter;
 use alerts::TelegramNotifier;
 
 use alloy::{
+    network::Ethereum,
     rpc::types::eth::Log,
     primitives::{Address, U256},
     providers::{Provider, ProviderBuilder},
     sol,
+    transports::Transport,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn, error, Level};
@@ -38,12 +40,13 @@ sol!(
     }
 );
 
-async fn fetch_token_decimals<P>(
+async fn fetch_token_decimals<T, P>(
     provider: P,
     token_address: Address,
 ) -> Result<u32, eyre::Report>
 where
-    P: Provider + Clone,
+    P: Provider<T, Ethereum> + Clone,
+    T: Transport + Clone,
 {
     let contract = IERC20::new(token_address, provider);
     match contract.decimals().call().await {
@@ -204,12 +207,12 @@ async fn main() -> Result<(), eyre::Report> {
     pool_tracker.set_min_profit_usd(config.min_profit_usd);
 
     // Create HTTP provider for dynamic ERC20 decimal queries
-    let rpc_url = config.alchemy_http.parse::<alloy::primitives::Url>()?;
+    let rpc_url = config.alchemy_http.parse::<reqwest::Url>()?;
     let provider = Arc::new(ProviderBuilder::new().on_http(rpc_url));
     let simulator = TxSimulator::provider_backed(config.alchemy_http.clone());
     let nonce_manager = if !config.dry_run {
         if let Some(executor_address) = config.executor_address {
-            Some(NonceManager::initialize(&provider, executor_address).await?)
+            Some(NonceManager::initialize(provider.as_ref(), executor_address).await?)
         } else {
             warn!("EXECUTOR_ADDRESS is not configured; live send will stay disabled.");
             None
@@ -318,10 +321,10 @@ async fn main() -> Result<(), eyre::Report> {
                                 // Monitor newly launched pools only when one side is a reliable base asset.
                                 if new_pool.token0 == weth || new_pool.token0 == usdc || new_pool.token1 == weth || new_pool.token1 == usdc {
                                     let dec0 = if new_pool.token0 == weth { 18 } else if new_pool.token0 == usdc { 6 } else {
-                                        fetch_token_decimals(provider.clone(), new_pool.token0).await.unwrap_or(18)
+                                        fetch_token_decimals(provider.as_ref().clone(), new_pool.token0).await.unwrap_or(18)
                                     };
                                     let dec1 = if new_pool.token1 == weth { 18 } else if new_pool.token1 == usdc { 6 } else {
-                                        fetch_token_decimals(provider.clone(), new_pool.token1).await.unwrap_or(18)
+                                        fetch_token_decimals(provider.as_ref().clone(), new_pool.token1).await.unwrap_or(18)
                                     };
 
                                     pool_tracker.register_token_decimals(new_pool.token0, dec0);
@@ -560,7 +563,7 @@ async fn main() -> Result<(), eyre::Report> {
 
                                                 let tx_hash = tx_builder
                                                     .send_transaction(
-                                                        &provider,
+                                                        provider.as_ref(),
                                                         nonce_manager,
                                                         best.request.call_data.clone(),
                                                         config.execution_gas_limit,

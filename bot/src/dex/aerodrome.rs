@@ -249,7 +249,7 @@ fn estimate_cl_amount_out(pool: &PoolState, token_in: Address, amount_in: U256) 
         (amount_in * U256::from(1_000_000u64.saturating_sub(fee_units as u64))) / fee_denominator;
 
     let q96 = U256::from(1) << 96;
-    let price = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
+    let price: U256 = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
     if price.is_zero() {
         return Ok(U256::ZERO);
     }
