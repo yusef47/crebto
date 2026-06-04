@@ -233,9 +233,9 @@ async fn main() -> Result<(), eyre::Report> {
                                             let profit_cents = (opp.estimated_profit_usd * 100.0) as u64;
                                             stats.total_estimated_profit_cents.fetch_add(profit_cents, Ordering::Relaxed);
 
-                                            info!("🎯 ARB DETECTED! {} vs {} | spread: {:.1} bps | est profit: ${:.2}",
+                                            info!("🎯 ARB DETECTED! {} vs {} | spread: {:.1} bps | est profit: ${:.2} | gas: ${:.4}",
                                                 opp.dex_a, opp.dex_b,
-                                                opp.spread_bps, opp.estimated_profit_usd
+                                                opp.spread_bps, opp.estimated_profit_usd, opp.gas_cost_usd
                                             );
                                             info!("   Pool A: {:#x} ({})", opp.pool_a, opp.dex_a);
                                             info!("   Pool B: {:#x} ({})", opp.pool_b, opp.dex_b);

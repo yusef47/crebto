@@ -1,5 +1,6 @@
 use alloy::primitives::{Address, U256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::info;
 
 /// Tracks pool states in memory, updated live from swap events.
@@ -30,6 +31,7 @@ pub struct ArbOpportunity {
     pub price_b: f64,
     pub spread_bps: f64,
     pub estimated_profit_usd: f64,
+    pub gas_cost_usd: f64,
 }
 
 /// Normalizes a token pair key (always smaller address first)
@@ -70,6 +72,10 @@ pub struct PoolTracker {
     pair_to_pools: HashMap<(Address, Address), Vec<Address>>,
     /// Known pool address -> (token0, token1, fee, dex_name) from hardcoded registry
     known_pools: HashMap<Address, (Address, Address, u32, String)>,
+    /// Current gas price in wei (updated each block)
+    current_gas_price_wei: u64,
+    /// Estimated gas units for a 2-hop flash arb tx on Base
+    estimated_gas_units: u64,
 }
 
 impl PoolTracker {
@@ -78,6 +84,8 @@ impl PoolTracker {
             pools: HashMap::new(),
             pair_to_pools: HashMap::new(),
             known_pools: HashMap::new(),
+            current_gas_price_wei: 50_000_000, // 0.05 gwei default (Base L2 typical)
+            estimated_gas_units: 350_000, // ~350k gas for a flash arb tx
         };
         tracker.load_known_pools();
         tracker
@@ -132,6 +140,51 @@ impl PoolTracker {
         let key = pair_key(token0, token1);
         self.known_pools.insert(address, (token0, token1, fee, dex.to_string()));
         self.pair_to_pools.entry(key).or_default().push(address);
+    }
+
+    /// Updates the current gas price from the latest block.
+    pub fn update_gas_price(&mut self, gas_price_wei: u64) {
+        self.current_gas_price_wei = gas_price_wei;
+    }
+
+    /// Estimates the gas cost of executing a flash arb in USD.
+    /// Uses ETH price derived from WETH/USDC pool data if available.
+    fn estimate_gas_cost_usd(&self) -> f64 {
+        // Gas cost in ETH = gas_price * gas_units / 1e18
+        let gas_cost_eth = (self.current_gas_price_wei as f64) * (self.estimated_gas_units as f64) / 1e18;
+
+        // Get ETH price from our tracked WETH/USDC pools
+        let eth_price_usd = self.get_eth_price_usd().unwrap_or(2500.0);
+
+        gas_cost_eth * eth_price_usd
+    }
+
+    /// Derives ETH/USD price from any tracked WETH/USDC pool.
+    fn get_eth_price_usd(&self) -> Option<f64> {
+        let weth: Address = "0x4200000000000000000000000000000000000006".parse().ok()?;
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().ok()?;
+        let key = pair_key(weth, usdc);
+
+        let pool_addrs = self.pair_to_pools.get(&key)?;
+        for addr in pool_addrs {
+            if let Some(pool) = self.pools.get(addr) {
+                if !pool.sqrt_price_x96.is_zero() {
+                    let raw_price = sqrt_price_to_f64(pool.sqrt_price_x96);
+                    // WETH is token0 in most Base pools, USDC is token1
+                    // price = token1/token0 = USDC per WETH
+                    // But USDC has 6 decimals, WETH has 18
+                    // So real_price = raw_price * 10^(18-6) = raw_price * 10^12
+                    if pool.token0 == weth {
+                        return Some(raw_price * 1e12);
+                    } else {
+                        if raw_price > 0.0 {
+                            return Some((1.0 / raw_price) * 1e12);
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Updates a pool's price state from a decoded V3-style swap event.
@@ -207,15 +260,17 @@ impl PoolTracker {
                 let spread_bps = ((higher - lower) / lower) * 10000.0;
 
                 // Combined fees from both pools (in bps)
-                let total_fee_bps = (pa.fee_bps + pb.fee_bps) as f64 / 100.0; // convert to bps percentage
+                let total_fee_bps = (pa.fee_bps + pb.fee_bps) as f64 / 100.0;
 
-                // Only report if spread exceeds combined fees + gas overhead (~5 bps for Base L2)
-                let min_spread = total_fee_bps + 5.0;
+                // Dynamic gas cost estimation
+                let gas_cost_usd = self.estimate_gas_cost_usd();
+
+                // Minimum profitable spread = fees + gas as percentage of trade
+                let trade_size_usd = 1000.0;
+                let gas_bps = (gas_cost_usd / trade_size_usd) * 10000.0;
+                let min_spread = total_fee_bps + gas_bps;
 
                 if spread_bps > min_spread {
-                    // Rough profit estimation in USD
-                    // Assuming $1000 trade size for estimation
-                    let trade_size_usd = 1000.0;
                     let profit_pct = (spread_bps - min_spread) / 10000.0;
                     let estimated_profit = trade_size_usd * profit_pct;
 
@@ -230,6 +285,7 @@ impl PoolTracker {
                         price_b,
                         spread_bps,
                         estimated_profit_usd: estimated_profit,
+                        gas_cost_usd,
                     });
                 }
             }
