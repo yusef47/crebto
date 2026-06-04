@@ -136,11 +136,12 @@ async fn main() -> Result<(), eyre::Report> {
     loop {
         // Setup Channels
         let (log_tx, mut log_rx) = mpsc::channel::<Log>(500);
-        let (block_tx, mut block_rx) = mpsc::channel::<u64>(50);
+        let (block_tx, mut block_rx) = mpsc::channel::<(u64, u64)>(50);
 
         // Start WebSocket Listener (Collector)
         let listener = WsListener::new(config.alchemy_wss.clone());
-        match listener.listen(log_tx, block_tx).await {
+        let addresses = pool_tracker.get_known_addresses();
+        match listener.listen(log_tx, block_tx, addresses).await {
             Ok(_) => {
                 info!("✅ Connected to Base L2 via Alchemy WSS");
                 info!("🎧 Listening for swap events on Base L2...");
@@ -174,13 +175,15 @@ async fn main() -> Result<(), eyre::Report> {
                 // New Blocks
                 msg = block_rx.recv() => {
                     match msg {
-                        Some(block_number) => {
+                        Some((block_number, base_fee)) => {
                             current_block = block_number;
+                            pool_tracker.update_gas_price(base_fee);
                             stats.blocks_seen.fetch_add(1, Ordering::Relaxed);
                             // Log every 10th block to avoid spam
                             if stats.blocks_seen.load(Ordering::Relaxed) % 10 == 0 {
-                                info!("🧱 Block #{} (total blocks: {})",
+                                info!("🧱 Block #{} | Base Fee: {} wei (total blocks: {})",
                                     block_number,
+                                    base_fee,
                                     stats.blocks_seen.load(Ordering::Relaxed)
                                 );
                             }

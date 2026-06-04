@@ -22,7 +22,7 @@ impl WsListener {
         Self { wss_url }
     }
 
-    pub async fn listen(&self, log_tx: Sender<Log>, block_tx: Sender<u64>) -> Result<(), eyre::Report> {
+    pub async fn listen(&self, log_tx: Sender<Log>, block_tx: Sender<(u64, u64)>, addresses: Vec<Address>) -> Result<(), eyre::Report> {
         info!("Connecting to Alchemy WSS: {}", self.wss_url);
         let ws = WsConnect::new(&self.wss_url);
         let provider = ProviderBuilder::new().on_ws(ws).await?;
@@ -39,9 +39,12 @@ impl WsListener {
                     let mut stream = sub.into_stream();
                     while let Some(block) = stream.next().await {
                         let block_number = block.header.number;
+                        let base_fee = block.header.base_fee_per_gas
+                            .and_then(|v| u64::try_from(v).ok())
+                            .unwrap_or(50_000_000);
                         if block_number > 0 {
-                            if let Err(e) = block_tx_clone.send(block_number).await {
-                                error!("Failed to send block number: {:?}", e);
+                            if let Err(e) = block_tx_clone.send((block_number, base_fee)).await {
+                                error!("Failed to send block info: {:?}", e);
                                 break;
                             }
                         }
@@ -53,8 +56,9 @@ impl WsListener {
             }
         });
 
-        // Subscribe to Swap Logs
+        // Subscribe to Swap Logs (filtered by our tracked pool addresses)
         let filter = Filter::new()
+            .address(addresses)
             .event_signature(vec![
                 UNISWAP_V3_SWAP_TOPIC,
                 AERODROME_V2_SWAP_TOPIC,

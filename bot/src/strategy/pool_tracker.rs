@@ -298,4 +298,9 @@ impl PoolTracker {
     pub fn active_pool_count(&self) -> usize {
         self.pools.len()
     }
+
+    /// Returns a list of all pool addresses registered in the known pools mapping
+    pub fn get_known_addresses(&self) -> Vec<Address> {
+        self.known_pools.keys().cloned().collect()
+    }
 }
