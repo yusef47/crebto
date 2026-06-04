@@ -8,6 +8,8 @@ mod alerts;
 
 use config::Config;
 use stream::{WsListener, SwapDecoder, DecodedSwap};
+use stream::ws_listener::{UNISWAP_V3_SWAP_TOPIC, AERODROME_V2_SWAP_TOPIC};
+use strategy::PoolTracker;
 use alerts::TelegramNotifier;
 
 use alloy::{
@@ -30,6 +32,8 @@ pub struct BotStats {
     pub aerodrome_swaps: AtomicU64,
     pub blocks_seen: AtomicU64,
     pub consecutive_failures: AtomicU32,
+    pub tracked_pools_active: AtomicU32,
+    pub total_estimated_profit_cents: AtomicU64,
 }
 
 impl BotStats {
@@ -42,6 +46,8 @@ impl BotStats {
             aerodrome_swaps: AtomicU64::new(0),
             blocks_seen: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
+            tracked_pools_active: AtomicU32::new(0),
+            total_estimated_profit_cents: AtomicU64::new(0),
         }
     }
 
@@ -52,18 +58,23 @@ impl BotStats {
         let uni = self.uniswap_swaps.load(Ordering::Relaxed);
         let aero = self.aerodrome_swaps.load(Ordering::Relaxed);
         let blocks = self.blocks_seen.load(Ordering::Relaxed);
+        let tracked = self.tracked_pools_active.load(Ordering::Relaxed);
+        let profit_cents = self.total_estimated_profit_cents.load(Ordering::Relaxed);
+        let profit_usd = profit_cents as f64 / 100.0;
 
-        info!("╔══════════════════════════════════════════════╗");
-        info!("║        📊 CREBTO DRY-RUN REPORT             ║");
-        info!("╠══════════════════════════════════════════════╣");
-        info!("║ ⏱  Uptime: {} minutes                       ", elapsed_secs / 60);
-        info!("║ 🧱 Blocks seen: {}                          ", blocks);
-        info!("║ 🔄 Total swaps detected: {}                 ", swaps);
-        info!("║    ├─ Uniswap V3: {}                        ", uni);
-        info!("║    └─ Aerodrome:  {}                        ", aero);
-        info!("║ 🎯 Arbitrage opportunities: {}              ", opps);
-        info!("║ 💰 Profitable (after fees): {}              ", profitable);
-        info!("╚══════════════════════════════════════════════╝");
+        info!("╔══════════════════════════════════════════════════╗");
+        info!("║          📊 CREBTO DRY-RUN REPORT               ║");
+        info!("╠══════════════════════════════════════════════════╣");
+        info!("║ ⏱  Uptime: {} minutes                            ", elapsed_secs / 60);
+        info!("║ 🧱 Blocks seen: {}                               ", blocks);
+        info!("║ 🔄 Total swaps detected: {}                      ", swaps);
+        info!("║    ├─ Uniswap V3: {}                             ", uni);
+        info!("║    └─ Aerodrome CL: {}                           ", aero);
+        info!("║ 📋 Active tracked pools: {}                      ", tracked);
+        info!("║ 🎯 Arbitrage opportunities: {}                   ", opps);
+        info!("║ 💰 Profitable (after fees): {}                   ", profitable);
+        info!("║ 💵 Est. total profit: ${:.2}                     ", profit_usd);
+        info!("╚══════════════════════════════════════════════════╝");
     }
 }
 
@@ -77,8 +88,7 @@ async fn main() -> Result<(), eyre::Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("╔══════════════════════════════════════════════╗");
-    // Crebto main entrypoint
-    info!("Starting Crebto Arbitrage Bot...");
+    info!("║    🚀 Starting Crebto Arbitrage Bot v0.2    ║");
     info!("╚══════════════════════════════════════════════╝");
 
     // 2. Load Configuration
@@ -102,14 +112,8 @@ async fn main() -> Result<(), eyre::Report> {
         None
     };
 
-    // 4. Setup Channels
-    let (log_tx, mut log_rx) = mpsc::channel::<Log>(500);
-    let (block_tx, mut block_rx) = mpsc::channel::<u64>(50);
-
-    // 5. Start WebSocket Listener (Collector)
-    let listener = WsListener::new(config.alchemy_wss.clone());
-    listener.listen(log_tx, block_tx).await?;
-    info!("✅ Connected to Base L2 via Alchemy WSS");
+    // 4. Initialize Pool Tracker (Arbitrage Engine)
+    let mut pool_tracker = PoolTracker::new();
 
     // Bot Statistics Tracker
     let stats = Arc::new(BotStats::new());
@@ -126,77 +130,148 @@ async fn main() -> Result<(), eyre::Report> {
         }
     });
 
-    info!("🎧 Listening for swap events on Base L2...");
-    info!("   Monitoring: Uniswap V3 + Aerodrome");
-    info!("   Press Ctrl+C to stop.\n");
+    // 5. Main loop with auto-reconnection
+    let mut current_block: u64 = 0;
 
-    // 6. Event Loop
     loop {
-        // Kill Switch
-        let failures = stats.consecutive_failures.load(Ordering::SeqCst);
-        if failures >= config.max_consecutive_failures {
-            let msg = format!("🚨 KILL SWITCH: {} consecutive failures. Shutting down.", failures);
-            error!("{}", msg);
-            if let Some(ref n) = notifier {
-                n.send_message(&msg).await;
+        // Setup Channels
+        let (log_tx, mut log_rx) = mpsc::channel::<Log>(500);
+        let (block_tx, mut block_rx) = mpsc::channel::<u64>(50);
+
+        // Start WebSocket Listener (Collector)
+        let listener = WsListener::new(config.alchemy_wss.clone());
+        match listener.listen(log_tx, block_tx).await {
+            Ok(_) => {
+                info!("✅ Connected to Base L2 via Alchemy WSS");
+                info!("🎧 Listening for swap events on Base L2...");
+                info!("   Monitoring: Uniswap V3 + Aerodrome Slipstream");
             }
-            break;
-        }
-
-        tokio::select! {
-            // New Blocks
-            Some(block_number) = block_rx.recv() => {
-                stats.blocks_seen.fetch_add(1, Ordering::Relaxed);
-                // Log every 10th block to avoid spam
-                if stats.blocks_seen.load(Ordering::Relaxed) % 10 == 0 {
-                    info!("🧱 Block #{} (total blocks: {})", 
-                        block_number, 
-                        stats.blocks_seen.load(Ordering::Relaxed)
-                    );
-                }
-            }
-
-            // Incoming Swap Logs
-            Some(log) = log_rx.recv() => {
-                stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
-
-                let decoded = match SwapDecoder::decode(&log) {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                };
-
-                match decoded {
-                    DecodedSwap::UniswapV3 { pool, amount0, amount1, sqrt_price_x96, liquidity, tick, .. } => {
-                        stats.uniswap_swaps.fetch_add(1, Ordering::Relaxed);
-
-                        // Only log significant swaps (avoid spam from tiny trades)
-                        if amount0 > U256::from(1_000_000u64) || amount1 > U256::from(1_000_000u64) {
-                            info!("🔵 UniV3 Swap | Pool: {:#x} | amt0: {} | amt1: {} | tick: {}",
-                                pool, amount0, amount1, tick
-                            );
-                        }
-
-                        // TODO: In next phase, check if this pool has a matching pool 
-                        // on Aerodrome/SushiSwap for arbitrage
-                    }
-
-                    DecodedSwap::Aerodrome { pool, amount0_in, amount1_in, amount0_out, amount1_out } => {
-                        stats.aerodrome_swaps.fetch_add(1, Ordering::Relaxed);
-
-                        if amount0_in > U256::from(1_000_000u64) || amount1_in > U256::from(1_000_000u64) {
-                            info!("🟢 Aero Swap  | Pool: {:#x} | in0: {} | in1: {} | out0: {} | out1: {}",
-                                pool, amount0_in, amount1_in, amount0_out, amount1_out
-                            );
-                        }
-                    }
-                }
+            Err(e) => {
+                error!("❌ Failed to connect to WSS: {:?}. Retrying in 10s...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                continue;
             }
         }
+
+        // 6. Event Loop
+        let mut disconnected = false;
+        while !disconnected {
+            // Kill Switch
+            let failures = stats.consecutive_failures.load(Ordering::SeqCst);
+            if failures >= config.max_consecutive_failures {
+                let msg = format!("🚨 KILL SWITCH: {} consecutive failures. Shutting down.", failures);
+                error!("{}", msg);
+                if let Some(ref n) = notifier {
+                    n.send_message(&msg).await;
+                }
+                // Final report
+                let elapsed = start_time.elapsed().as_secs();
+                stats.print_report(elapsed);
+                return Ok(());
+            }
+
+            tokio::select! {
+                // New Blocks
+                msg = block_rx.recv() => {
+                    match msg {
+                        Some(block_number) => {
+                            current_block = block_number;
+                            stats.blocks_seen.fetch_add(1, Ordering::Relaxed);
+                            // Log every 10th block to avoid spam
+                            if stats.blocks_seen.load(Ordering::Relaxed) % 10 == 0 {
+                                info!("🧱 Block #{} (total blocks: {})",
+                                    block_number,
+                                    stats.blocks_seen.load(Ordering::Relaxed)
+                                );
+                            }
+                        }
+                        None => {
+                            warn!("⚠️ Block channel closed. Connection lost.");
+                            disconnected = true;
+                        }
+                    }
+                }
+
+                // Incoming Swap Logs
+                msg = log_rx.recv() => {
+                    match msg {
+                        Some(log) => {
+                            stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
+
+                            let decoded = match SwapDecoder::decode(&log) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    let topics = log.topics();
+                                    if !topics.is_empty() && (topics[0] == UNISWAP_V3_SWAP_TOPIC || topics[0] == AERODROME_V2_SWAP_TOPIC) {
+                                        warn!("Failed to decode swap log: {:?}", e);
+                                    }
+                                    continue;
+                                }
+                            };
+
+                            match decoded {
+                                DecodedSwap::UniswapV3 { pool, amount0, amount1, sqrt_price_x96, liquidity, tick, .. } => {
+                                    stats.uniswap_swaps.fetch_add(1, Ordering::Relaxed);
+
+                                    // Update pool tracker and check for arbitrage
+                                    let opportunities = pool_tracker.update_from_swap(
+                                        pool, sqrt_price_x96, liquidity, tick, current_block
+                                    );
+
+                                    // Update active pool count
+                                    stats.tracked_pools_active.store(
+                                        pool_tracker.active_pool_count() as u32, Ordering::Relaxed
+                                    );
+
+                                    // Process detected opportunities
+                                    for opp in &opportunities {
+                                        stats.opportunities_found.fetch_add(1, Ordering::Relaxed);
+
+                                        // Estimate if profitable after all fees
+                                        if opp.estimated_profit_usd > 0.10 {
+                                            stats.profitable_after_fees.fetch_add(1, Ordering::Relaxed);
+                                            let profit_cents = (opp.estimated_profit_usd * 100.0) as u64;
+                                            stats.total_estimated_profit_cents.fetch_add(profit_cents, Ordering::Relaxed);
+
+                                            info!("🎯 ARB DETECTED! {} vs {} | spread: {:.1} bps | est profit: ${:.2}",
+                                                opp.dex_a, opp.dex_b,
+                                                opp.spread_bps, opp.estimated_profit_usd
+                                            );
+                                            info!("   Pool A: {:#x} ({})", opp.pool_a, opp.dex_a);
+                                            info!("   Pool B: {:#x} ({})", opp.pool_b, opp.dex_b);
+                                            info!("   Price A: {:.8} | Price B: {:.8}", opp.price_a, opp.price_b);
+
+                                            // In DRY_RUN: just log. In LIVE: would execute.
+                                            if !config.dry_run {
+                                                info!("🚀 EXECUTING arbitrage (LIVE MODE)...");
+                                                // TODO: Execute via FlashArb contract
+                                            }
+                                        }
+                                    }
+                                }
+
+                                DecodedSwap::Aerodrome { pool, amount0_in, amount1_in, amount0_out, amount1_out } => {
+                                    stats.aerodrome_swaps.fetch_add(1, Ordering::Relaxed);
+
+                                    if amount0_in > U256::from(1_000_000u64) || amount1_in > U256::from(1_000_000u64) {
+                                        info!("🟢 Aero V2 Swap | Pool: {:#x} | in0: {} | in1: {} | out0: {} | out1: {}",
+                                            pool, amount0_in, amount1_in, amount0_out, amount1_out
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            warn!("⚠️ Log channel closed. Connection lost.");
+                            disconnected = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Connection lost — wait and reconnect
+        warn!("🔄 Reconnecting in 5 seconds...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
-
-    // Final report
-    let elapsed = start_time.elapsed().as_secs();
-    stats.print_report(elapsed);
-
-    Ok(())
 }
