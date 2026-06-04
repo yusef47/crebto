@@ -8,6 +8,7 @@ pub struct Config {
     pub alchemy_http: String,
     pub dry_run: bool,
     pub private_key: Option<String>,
+    pub executor_address: Option<Address>,
     pub contract_address: Option<Address>,
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
@@ -15,6 +16,16 @@ pub struct Config {
     pub min_eth_balance: f64,
     pub max_loss_per_hour_usd: f64,
     pub max_consecutive_failures: u32,
+    pub min_profit_usd: f64,
+    pub require_simulation: bool,
+    pub enable_live_send: bool,
+    pub uniswap_v3_router: Option<Address>,
+    pub aerodrome_router: Option<Address>,
+    pub aerodrome_slipstream_router: Option<Address>,
+    pub aerodrome_factory: Option<Address>,
+    pub execution_gas_limit: u64,
+    pub slippage_bps: u32,
+    pub probe_sizes_usd: Vec<f64>,
 }
 
 impl Config {
@@ -36,7 +47,11 @@ impl Config {
 
         // In DRY_RUN mode, private key and contract address are optional
         let private_key = env::var("PRIVATE_KEY").ok();
-        
+
+        let executor_address = env::var("EXECUTOR_ADDRESS")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
         let contract_address = env::var("CONTRACT_ADDRESS")
             .ok()
             .and_then(|s| Address::from_str(&s).ok());
@@ -64,11 +79,61 @@ impl Config {
             .parse::<u32>()
             .unwrap_or(50);
 
+        let min_profit_usd = env::var("MIN_PROFIT_USD")
+            .unwrap_or_else(|_| "1.0".to_string())
+            .parse::<f64>()
+            .unwrap_or(1.0);
+
+        let require_simulation = env::var("REQUIRE_SIMULATION")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        let enable_live_send = env::var("ENABLE_LIVE_SEND")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .unwrap_or(false);
+
+        let uniswap_v3_router = env::var("UNISWAP_V3_ROUTER")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
+        let aerodrome_router = env::var("AERODROME_ROUTER")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
+        let aerodrome_slipstream_router = env::var("AERODROME_SLIPSTREAM_ROUTER")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok())
+            .or(aerodrome_router);
+
+        let aerodrome_factory = env::var("AERODROME_FACTORY")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
+        let execution_gas_limit = env::var("EXECUTION_GAS_LIMIT")
+            .unwrap_or_else(|_| "600000".to_string())
+            .parse::<u64>()
+            .unwrap_or(600_000);
+
+        let slippage_bps = env::var("SLIPPAGE_BPS")
+            .unwrap_or_else(|_| "50".to_string())
+            .parse::<u32>()
+            .unwrap_or(50);
+
+        let probe_sizes_usd = env::var("PROBE_SIZES_USD")
+            .unwrap_or_else(|_| "10,50,100,200".to_string())
+            .split(',')
+            .filter_map(|raw| raw.trim().parse::<f64>().ok())
+            .filter(|value| *value > 0.0)
+            .collect::<Vec<_>>();
+
         Ok(Self {
             alchemy_wss,
             alchemy_http,
             dry_run,
             private_key,
+            executor_address,
             contract_address,
             telegram_bot_token,
             telegram_chat_id,
@@ -76,6 +141,16 @@ impl Config {
             min_eth_balance,
             max_loss_per_hour_usd,
             max_consecutive_failures,
+            min_profit_usd,
+            require_simulation,
+            enable_live_send,
+            uniswap_v3_router,
+            aerodrome_router,
+            aerodrome_slipstream_router,
+            aerodrome_factory,
+            execution_gas_limit,
+            slippage_bps,
+            probe_sizes_usd,
         })
     }
 }

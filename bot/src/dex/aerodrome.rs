@@ -4,9 +4,9 @@ use alloy::{
     sol,
     sol_types::SolCall,
 };
-use eyre::Result;
+use eyre::{eyre, Result};
 
-// ABI representation for Aerodrome router calls
+// ABI representation for Aerodrome Standard and Slipstream router calls.
 sol! {
     struct Route {
         address from;
@@ -24,12 +24,36 @@ sol! {
             uint256 deadline
         ) external returns (uint256[] memory amounts);
     }
+
+    struct SlipstreamExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        int24 tickSpacing;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    interface IAeroSlipstreamRouter {
+        function exactInputSingle(
+            SlipstreamExactInputSingleParams calldata params
+        ) external payable returns (uint256 amountOut);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AerodromeRouterKind {
+    Standard,
+    Slipstream,
 }
 
 pub struct AerodromeQuoter {
     pub router_address: Address,
     pub factory_address: Address,
     pub is_stable: bool,
+    pub kind: AerodromeRouterKind,
 }
 
 impl AerodromeQuoter {
@@ -38,6 +62,16 @@ impl AerodromeQuoter {
             router_address,
             factory_address,
             is_stable,
+            kind: AerodromeRouterKind::Standard,
+        }
+    }
+
+    pub fn slipstream(router_address: Address, factory_address: Address) -> Self {
+        Self {
+            router_address,
+            factory_address,
+            is_stable: false,
+            kind: AerodromeRouterKind::Slipstream,
         }
     }
 }
@@ -51,6 +85,10 @@ impl DexQuoter for AerodromeQuoter {
     ) -> Result<U256> {
         if amount_in.is_zero() {
             return Ok(U256::ZERO);
+        }
+
+        if self.kind == AerodromeRouterKind::Slipstream {
+            return estimate_cl_amount_out(pool, token_in, amount_in);
         }
 
         let (reserve_in, reserve_out) = if token_in == pool.token0 {
@@ -154,6 +192,29 @@ impl DexQuoter for AerodromeQuoter {
         recipient: Address,
     ) -> Result<(Address, Bytes)> {
         let token_out = if token_in == pool.token0 { pool.token1 } else { pool.token0 };
+        let deadline = U256::from(999999999999999u64);
+
+        if self.kind == AerodromeRouterKind::Slipstream {
+            let tick_spacing = pool
+                .tick_spacing
+                .ok_or_else(|| eyre!("Slipstream pool missing tick spacing"))?;
+
+            let params = SlipstreamExactInputSingleParams {
+                tokenIn: token_in,
+                tokenOut: token_out,
+                tickSpacing: tick_spacing
+                    .try_into()
+                    .map_err(|_| eyre!("Invalid Slipstream tick spacing: {}", tick_spacing))?,
+                recipient,
+                deadline,
+                amountIn: amount_in,
+                amountOutMinimum: min_amount_out,
+                sqrtPriceLimitX96: alloy::primitives::aliases::U160::ZERO,
+            };
+
+            let call_data = IAeroSlipstreamRouter::exactInputSingleCall { params }.abi_encode();
+            return Ok((self.router_address, Bytes::from(call_data)));
+        }
 
         let route = Route {
             from: token_in,
@@ -163,9 +224,6 @@ impl DexQuoter for AerodromeQuoter {
         };
 
         let routes = vec![route];
-
-        // 20 minute deadline from execution (can be any far future timestamp)
-        let deadline = U256::from(999999999999999u64);
 
         let call_data = IAeroRouter::swapExactTokensForTokensCall {
             amountIn: amount_in,
@@ -177,5 +235,30 @@ impl DexQuoter for AerodromeQuoter {
         .abi_encode();
 
         Ok((self.router_address, Bytes::from(call_data)))
+    }
+}
+
+fn estimate_cl_amount_out(pool: &PoolState, token_in: Address, amount_in: U256) -> Result<U256> {
+    if pool.liquidity == 0 || pool.sqrt_price_x96.is_zero() {
+        return Ok(U256::ZERO);
+    }
+
+    let fee_units = pool.fee_bps;
+    let fee_denominator = U256::from(1_000_000u64);
+    let amount_in_after_fee =
+        (amount_in * U256::from(1_000_000u64.saturating_sub(fee_units as u64))) / fee_denominator;
+
+    let q96 = U256::from(1) << 96;
+    let price = (pool.sqrt_price_x96 * pool.sqrt_price_x96) / q96;
+    if price.is_zero() {
+        return Ok(U256::ZERO);
+    }
+
+    if token_in == pool.token0 {
+        Ok((amount_in_after_fee * price) / q96)
+    } else if token_in == pool.token1 {
+        Ok((amount_in_after_fee * q96) / price)
+    } else {
+        Err(eyre!("Token input is not part of Slipstream pool"))
     }
 }

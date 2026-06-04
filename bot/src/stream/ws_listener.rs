@@ -13,6 +13,10 @@ pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350
 
 pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d824");
 
+pub const UNISWAP_V3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
+pub const AERODROME_V2_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
+pub const AERODROME_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
+
 pub struct WsListener {
     wss_url: String,
 }
@@ -79,6 +83,35 @@ impl WsListener {
                 }
                 Err(e) => {
                     error!("Logs subscription error: {:?}", e);
+                }
+            }
+        });
+
+        // Subscribe to factory logs. PoolCreated signatures differ between
+        // Uniswap V3, Aerodrome V2, and Aerodrome Slipstream, so parsing is
+        // done downstream against the emitting factory address.
+        let factory_filter = Filter::new()
+            .address(vec![
+                UNISWAP_V3_FACTORY,
+                AERODROME_V2_FACTORY,
+                AERODROME_SLIPSTREAM_FACTORY,
+            ]);
+
+        let factory_provider = provider.clone();
+        let factory_tx_clone = log_tx.clone();
+        tokio::spawn(async move {
+            match factory_provider.subscribe_logs(&factory_filter).await {
+                Ok(sub) => {
+                    let mut stream = sub.into_stream();
+                    while let Some(log) = stream.next().await {
+                        if let Err(e) = factory_tx_clone.send(log).await {
+                            error!("Failed to send factory log: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Factory logs subscription error: {:?}", e);
                 }
             }
         });

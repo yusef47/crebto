@@ -15,7 +15,7 @@ impl NonceManager {
         }
     }
 
-    pub async fn initialize<P: Provider<alloy::pubsub::PubSubFrontend>>(
+    pub async fn initialize<P: Provider>(
         provider: &Arc<P>,
         address: Address,
     ) -> Result<Self, eyre::Report> {

@@ -2,7 +2,6 @@ use alloy::{
     network::{TransactionBuilder, EthereumWallet},
     primitives::{Address, Bytes, U256},
     providers::Provider,
-    pubsub::PubSubFrontend,
     rpc::types::eth::TransactionRequest,
     signers::local::PrivateKeySigner,
     sol,
@@ -24,6 +23,7 @@ sol! {
         function executeArbitrage(
             address asset,
             uint256 amount,
+            uint256 minProfit,
             SwapStep[] calldata swapSteps
         ) external;
     }
@@ -48,6 +48,7 @@ impl TxBuilder {
         &self,
         asset: Address,
         amount: U256,
+        min_profit: U256,
         steps: Vec<(Address, Bytes)>,
     ) -> Bytes {
         let swap_steps: Vec<SwapStep> = steps
@@ -61,6 +62,7 @@ impl TxBuilder {
         let call = IFlashArb::executeArbitrageCall {
             asset,
             amount,
+            minProfit: min_profit,
             swapSteps: swap_steps,
         };
 
@@ -68,7 +70,7 @@ impl TxBuilder {
     }
 
     /// Sends the signed transaction to Base
-    pub async fn send_transaction<P: Provider<PubSubFrontend>>(
+    pub async fn send_transaction<P: Provider>(
         &self,
         provider: &Arc<P>,
         nonce_manager: &NonceManager,

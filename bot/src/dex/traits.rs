@@ -9,6 +9,7 @@ pub struct PoolState {
     pub reserve0: U256,
     pub reserve1: U256,
     pub fee_bps: u32,
+    pub tick_spacing: Option<i32>, // For Slipstream CL
     pub sqrt_price_x96: U256, // For V3
     pub liquidity: u128,      // For V3
     pub current_tick: i32,    // For V3

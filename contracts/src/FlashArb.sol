@@ -46,6 +46,7 @@ interface IERC20 {
 contract FlashArb is IFlashLoanSimpleReceiver {
     address public immutable owner;
     address public immutable pool;
+    mapping(address => bool) public allowedTargets;
 
     struct SwapStep {
         address target;   // The DEX router or pool contract to call
@@ -57,8 +58,12 @@ contract FlashArb is IFlashLoanSimpleReceiver {
     error OnlyPool();
     error ExecutionFailed();
     error InsufficientProfit();
+    error InvalidInitiator();
+    error TargetNotAllowed(address target);
+    error TokenTransferFailed();
 
     event ArbitrageExecuted(address indexed asset, uint256 profit);
+    event TargetAllowed(address indexed target, bool allowed);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert OnlyOwner();
@@ -79,14 +84,16 @@ contract FlashArb is IFlashLoanSimpleReceiver {
      * @notice Initiates the flash loan and arbitrage process.
      * @param asset The address of the token to borrow (e.g. USDC, WETH)
      * @param amount The amount to borrow
+     * @param minProfit The minimum net profit required after repaying the flash loan
      * @param swapSteps The arbitrary execution steps for the swaps
      */
     function executeArbitrage(
         address asset,
         uint256 amount,
+        uint256 minProfit,
         SwapStep[] calldata swapSteps
     ) external onlyOwner {
-        bytes memory params = abi.encode(swapSteps);
+        bytes memory params = abi.encode(minProfit, swapSteps);
         
         // Initiate Flash Loan on Aave V3 Pool
         IPool(pool).flashLoanSimple(
@@ -99,6 +106,14 @@ contract FlashArb is IFlashLoanSimpleReceiver {
     }
 
     /**
+     * @notice Allows or blocks a swap target. Keep this list limited to trusted routers/pools.
+     */
+    function setTargetAllowed(address target, bool allowed) external onlyOwner {
+        allowedTargets[target] = allowed;
+        emit TargetAllowed(target, allowed);
+    }
+
+    /**
      * @notice Callback invoked by Aave Pool after sending the borrowed funds.
      */
     function executeOperation(
@@ -108,12 +123,15 @@ contract FlashArb is IFlashLoanSimpleReceiver {
         address initiator,
         bytes calldata params
     ) external override onlyPool returns (bool) {
+        if (initiator != address(this)) revert InvalidInitiator();
+
         // Decode the swap steps
-        SwapStep[] memory swapSteps = abi.decode(params, (SwapStep[]));
+        (uint256 minProfit, SwapStep[] memory swapSteps) = abi.decode(params, (uint256, SwapStep[]));
 
         // Execute each swap step (Arbitrary execution)
         uint256 stepsLength = swapSteps.length;
         for (uint256 i = 0; i < stepsLength; ) {
+            if (!allowedTargets[swapSteps[i].target]) revert TargetNotAllowed(swapSteps[i].target);
             (bool success, ) = swapSteps[i].target.call(swapSteps[i].callData);
             if (!success) revert ExecutionFailed();
             
@@ -127,15 +145,15 @@ contract FlashArb is IFlashLoanSimpleReceiver {
 
         // Ensure we have enough to repay Aave
         uint256 currentBalance = IERC20(asset).balanceOf(address(this));
-        if (currentBalance < amountToRepay) revert InsufficientProfit();
+        if (currentBalance < amountToRepay + minProfit) revert InsufficientProfit();
 
         // Approve Pool to pull the repayment amount
-        IERC20(asset).approve(pool, amountToRepay);
+        if (!IERC20(asset).approve(pool, amountToRepay)) revert TokenTransferFailed();
 
         // Send remaining profit to owner
         uint256 profit = currentBalance - amountToRepay;
         if (profit > 0) {
-            IERC20(asset).transfer(owner, profit);
+            if (!IERC20(asset).transfer(owner, profit)) revert TokenTransferFailed();
             emit ArbitrageExecuted(asset, profit);
         }
 
@@ -147,7 +165,7 @@ contract FlashArb is IFlashLoanSimpleReceiver {
      */
     function rescueTokens(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
-        IERC20(token).transfer(owner, balance);
+        if (!IERC20(token).transfer(owner, balance)) revert TokenTransferFailed();
     }
 
     /**
