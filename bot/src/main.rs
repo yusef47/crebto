@@ -4,7 +4,7 @@
 
 use alloy::{
     primitives::{address, Address, B256, U256},
-    providers::{ProviderBuilder, WsConnect},
+    providers::{Provider, ProviderBuilder, WsConnect},
     rpc::types::eth::Filter,
     sol,
 };
