@@ -32,7 +32,9 @@ pub const AERODROME_SLIPSTREAM_POOL_CREATED_TOPIC: B256 = alloy::primitives::b25
 
 pub const UNISWAP_V3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
 pub const AERODROME_V2_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
+pub const AERODROME_V2_ROUTER: Address = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
 pub const AERODROME_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
+pub const ZERO_ADDRESS: Address = address!("0000000000000000000000000000000000000000");
 
 // --- TARGET ASSETS ADDRESSES & DECIMALS ---
 pub const WETH: Address = address!("4200000000000000000000000000000000000006");
@@ -43,13 +45,34 @@ pub const DEGEN: Address = address!("4ed4E862860beD51a9570b96d89aF5E1B0Efefed");
 pub const TOSHI: Address = address!("8544fe9d190fd7ec52860abbf45088e81ee24a8c");
 pub const MIGGLES: Address = address!("B1a03EdA10342529bBF8EB700a06C60441fEf25d");
 
-sol!(
+sol! {
     #[sol(rpc)]
     interface IERC20 {
         function decimals() external view returns (uint8);
         function symbol() external view returns (string);
     }
-);
+
+    #[sol(rpc)]
+    interface IAerodromeRouter {
+        function poolFor(address tokenA, address tokenB, bool stable, address factory) external view returns (address pool);
+    }
+
+    #[sol(rpc)]
+    interface IAerodromeV2Pool {
+        function token0() external view returns (address token);
+        function token1() external view returns (address token);
+        function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint32 blockTimestampLast);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V2PoolSpec {
+    token_a: Address,
+    token_b: Address,
+    stable: bool,
+    fee_bps: u32,
+    label: &'static str,
+}
 
 #[derive(Debug, Clone)]
 pub struct TrackedPool {
@@ -205,6 +228,31 @@ fn simulate_aerodrome_v2_swap(
     let numerator = amount_in_with_fee * reserve_out;
     let denominator = (reserve_in * U256::from(10000)) + amount_in_with_fee;
     numerator / denominator
+}
+
+fn sqrt_price_x96_from_reserves(reserve0: U256, reserve1: U256) -> U256 {
+    if reserve0.is_zero() || reserve1.is_zero() {
+        return U256::ZERO;
+    }
+
+    let r0 = u256_to_f64(reserve0);
+    let r1 = u256_to_f64(reserve1);
+    let sqrt_price = (r1 / r0).sqrt();
+    let q96: f64 = (2.0_f64).powi(96);
+    U256::from((sqrt_price * q96) as u128)
+}
+
+fn aerodrome_v2_pool_specs() -> Vec<V2PoolSpec> {
+    vec![
+        V2PoolSpec { token_a: WETH, token_b: USDC, stable: true,  fee_bps: 4,  label: "WETH/USDC stable" },
+        V2PoolSpec { token_a: WETH, token_b: USDC, stable: false, fee_bps: 30, label: "WETH/USDC volatile" },
+        V2PoolSpec { token_a: AERO, token_b: USDC, stable: false, fee_bps: 30, label: "AERO/USDC volatile" },
+        V2PoolSpec { token_a: AERO, token_b: WETH, stable: false, fee_bps: 30, label: "AERO/WETH volatile" },
+        V2PoolSpec { token_a: BRETT, token_b: WETH, stable: false, fee_bps: 30, label: "BRETT/WETH volatile" },
+        V2PoolSpec { token_a: DEGEN, token_b: WETH, stable: false, fee_bps: 30, label: "DEGEN/WETH volatile" },
+        V2PoolSpec { token_a: TOSHI, token_b: WETH, stable: false, fee_bps: 30, label: "TOSHI/WETH volatile" },
+        V2PoolSpec { token_a: MIGGLES, token_b: WETH, stable: false, fee_bps: 30, label: "MIGGLES/WETH volatile" },
+    ]
 }
 
 // --- OPTIMIZATION ALGORITHM (BINARY SEARCH) ---
@@ -374,7 +422,6 @@ impl PoolRegistry {
 
         // === DEGEN/WETH pools ===
         self.register_pool(address!("c9034c3e7f58003e6ae0c8438e7c8f4598d5acaa"), DEGEN, WETH, 3000, "uniswap_v3");      // Uni V3 0.3%  $1.4M liquidity
-        self.register_pool(address!("2c4909355b0c036840819484c3a882a95659abf3"), DEGEN, WETH, 3000, "aerodrome_v2");     // Aero V2      $34k liquidity
         self.register_pool(address!("afb62448929664bfccb0aae22f232520e765ba88"), DEGEN, WETH, 3000, "aerodrome_cl");     // Aero Slipstream $18k
 
         // === AERO/USDC pools (from previous research) ===
@@ -388,26 +435,46 @@ impl PoolRegistry {
     }
 
     fn register_pool(&mut self, address: Address, token0: Address, token1: Address, fee: u32, dex: &str) {
+        self.register_pool_with_state(address, token0, token1, fee, dex, U256::ZERO, U256::ZERO);
+    }
+
+    fn register_pool_with_state(
+        &mut self,
+        address: Address,
+        token0: Address,
+        token1: Address,
+        fee: u32,
+        dex: &str,
+        reserve0: U256,
+        reserve1: U256,
+    ) {
         let key = if token0 < token1 { (token0, token1) } else { (token1, token0) };
         let entry = self.pair_to_pools.entry(key).or_default();
         if !entry.contains(&address) {
             entry.push(address);
         }
+
+        let sqrt_price_x96 = if dex == "aerodrome_v2" {
+            sqrt_price_x96_from_reserves(reserve0, reserve1)
+        } else {
+            U256::ZERO
+        };
+
         self.pools.insert(
             address,
             TrackedPool {
                 address,
                 token0,
                 token1,
-                sqrt_price_x96: U256::ZERO,
+                sqrt_price_x96,
                 liquidity: 0,
                 tick: 0,
                 fee_bps: fee,
                 tick_spacing: None,
                 dex_name: dex.to_string(),
                 last_update_block: 0,
-                reserve0: U256::ZERO,
-                reserve1: U256::ZERO,
+                reserve0,
+                reserve1,
             },
         );
     }
@@ -436,23 +503,8 @@ impl PoolRegistry {
             pool.reserve1 = pool.reserve1.saturating_add(amount1_in).saturating_sub(amount1_out);
             pool.last_update_block = block;
 
-            // Compute synthetic sqrtPriceX96 from reserves for spread comparison
-            // price = reserve1 / reserve0
-            // sqrtPriceX96 = sqrt(price) * 2^96
-            // We compute: sqrtPriceX96 = sqrt(reserve1 * 2^192 / reserve0)
-            let synthetic_sqrt = if !pool.reserve0.is_zero() && !pool.reserve1.is_zero() {
-                // Use floating point for the synthetic price (only used for spread comparison)
-                let r0 = u256_to_f64(pool.reserve0);
-                let r1 = u256_to_f64(pool.reserve1);
-                let price = r1 / r0;
-                let sqrt_price = price.sqrt();
-                let q96: f64 = (2.0_f64).powi(96);
-                let val = sqrt_price * q96;
-                U256::from(val as u128)
-            } else {
-                U256::ZERO
-            };
-
+            // Compute synthetic sqrtPriceX96 from reserves for spread comparison.
+            let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1);
             pool.sqrt_price_x96 = synthetic_sqrt;
 
             (pool.token0, pool.token1, pool.dex_name.clone(), synthetic_sqrt)
@@ -531,10 +583,10 @@ async fn main() -> Result<(), eyre::Report> {
     info!("║    🚀 Starting Crebto Arbitrage Bot v0.3    ║");
     info!("╚══════════════════════════════════════════════╝");
 
-    // Load WSS URL from Environment variables (Kaggle secrets)
-    let wss_url = std::env::var("BASE_WSS_URL").unwrap_or_else(|_| {
-        "wss://base-mainnet.g.alchemy.com/v2/ej-Lwz66G8_fIto7YGICA".to_string()
-    });
+    // Load WSS URL from environment variables (Kaggle/GitHub secrets only).
+    let wss_url = std::env::var("ALCHEMY_WSS")
+        .or_else(|_| std::env::var("BASE_WSS_URL"))
+        .map_err(|_| eyre::eyre!("Set ALCHEMY_WSS or BASE_WSS_URL before starting the bot"))?;
 
     let weth_price_usd = 2500.0; // Dynamic or fallback price
 
@@ -554,13 +606,72 @@ async fn main() -> Result<(), eyre::Report> {
     });
 
     info!("DRY RUN MODE: {}", DRY_RUN);
-    info!("Connecting to WSS Stream: {}", wss_url);
+    info!("Connecting to configured WSS stream");
 
     let ws = WsConnect::new(&wss_url);
     let provider = ProviderBuilder::new().on_ws(ws).await?;
     let provider = Arc::new(provider);
 
-    info!("Connected successfully. Subscribing to events...");
+    info!("Connected successfully. Loading Aerodrome V2 pools from router...");
+
+    let router = IAerodromeRouter::new(AERODROME_V2_ROUTER, provider.as_ref());
+    for spec in aerodrome_v2_pool_specs() {
+        match router.poolFor(spec.token_a, spec.token_b, spec.stable, AERODROME_V2_FACTORY).call().await {
+            Ok(pool_result) if pool_result.pool != ZERO_ADDRESS => {
+                let v2_pool = IAerodromeV2Pool::new(pool_result.pool, provider.as_ref());
+                let token0 = match v2_pool.token0().call().await {
+                    Ok(result) => result.token,
+                    Err(err) => {
+                        warn!("Aerodrome V2 {} skipped: token0() failed for {:?}: {}", spec.label, pool_result.pool, err);
+                        continue;
+                    }
+                };
+                let token1 = match v2_pool.token1().call().await {
+                    Ok(result) => result.token,
+                    Err(err) => {
+                        warn!("Aerodrome V2 {} skipped: token1() failed for {:?}: {}", spec.label, pool_result.pool, err);
+                        continue;
+                    }
+                };
+                let reserves = match v2_pool.getReserves().call().await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        warn!("Aerodrome V2 {} skipped: getReserves() failed for {:?}: {}", spec.label, pool_result.pool, err);
+                        continue;
+                    }
+                };
+                let reserve0 = reserves.reserve0;
+                let reserve1 = reserves.reserve1;
+
+                if reserve0.is_zero() || reserve1.is_zero() {
+                    warn!("Aerodrome V2 {} skipped: empty reserves at {:?}", spec.label, pool_result.pool);
+                    continue;
+                }
+
+                registry.register_pool_with_state(
+                    pool_result.pool,
+                    token0,
+                    token1,
+                    spec.fee_bps,
+                    "aerodrome_v2",
+                    reserve0,
+                    reserve1,
+                );
+                info!(
+                    "Loaded Aerodrome V2 {} pool {:?}: token0={:?}, token1={:?}, r0={}, r1={}",
+                    spec.label, pool_result.pool, token0, token1, reserve0, reserve1
+                );
+            }
+            Ok(_) => {
+                info!("Aerodrome V2 {} pool not found by router", spec.label);
+            }
+            Err(err) => {
+                warn!("Aerodrome V2 {} router lookup failed: {}", spec.label, err);
+            }
+        }
+    }
+
+    info!("Subscribing to events for {} tracked pools...", registry.pools.len());
 
     let filter = Filter::new()
         .address(registry.pools.keys().cloned().collect::<Vec<_>>())
