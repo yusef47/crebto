@@ -512,6 +512,8 @@ async fn main() -> Result<(), eyre::Report> {
     let mut sub_logs = provider.subscribe_logs(&filter).await?.into_stream();
     let mut sub_blocks = provider.subscribe_blocks().await?.into_stream();
 
+    stats.tracked_pools_active.store(registry.pools.len() as u32, Ordering::Relaxed);
+
     let mut current_block = 0u64;
 
     loop {
@@ -541,6 +543,7 @@ async fn main() -> Result<(), eyre::Report> {
                         // Extract sqrtPriceX96 from [64..96] and liquidity from [96..128]
                         sqrt_price = U256::from_be_slice(&log_data.data[64..96]);
                         liquidity = U256::from_be_slice(&log_data.data[96..128]).to::<u128>();
+                        info!("DECODED SWAP: pool={:?}, sqrt_price={}, liquidity={}", pool_address, sqrt_price, liquidity);
                     }
                 } else if topic0 == AERODROME_V2_SWAP_TOPIC {
                     stats.aerodrome_swaps.fetch_add(1, Ordering::Relaxed);
