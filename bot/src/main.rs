@@ -35,13 +35,13 @@ pub const AERODROME_V2_FACTORY: Address = address!("420DD381b31aEf6683db6B902084
 pub const AERODROME_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
 
 // --- TARGET ASSETS ADDRESSES & DECIMALS ---
-pub const WETH: Address = address!("0x4200000000000000000000000000000000000006");
-pub const USDC: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
-pub const AERO: Address = address!("0x940181a94A35A4569E4529A3CDfB74e38FD98631");
-pub const BRETT: Address = address!("0x532f27101965dd16442e59d40670faf5ebb142e4");
-pub const DEGEN: Address = address!("0x4ed4E862860beD51a9570b96d89aF5E1B0Efefed");
-pub const TOSHI: Address = address!("0x8544fe9d190fd7ec52860abbf45088e81ee24a8c");
-pub const MIGGLES: Address = address!("0xB1a03EdA10342529bBF8EB700a06C60441fEf25d");
+pub const WETH: Address = address!("4200000000000000000000000000000000000006");
+pub const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+pub const AERO: Address = address!("940181a94A35A4569E4529A3CDfB74e38FD98631");
+pub const BRETT: Address = address!("532f27101965dd16442e59d40670faf5ebb142e4");
+pub const DEGEN: Address = address!("4ed4E862860beD51a9570b96d89aF5E1B0Efefed");
+pub const TOSHI: Address = address!("8544fe9d190fd7ec52860abbf45088e81ee24a8c");
+pub const MIGGLES: Address = address!("B1a03EdA10342529bBF8EB700a06C60441fEf25d");
 
 sol!(
     #[sol(rpc)]
@@ -348,11 +348,30 @@ impl PoolRegistry {
         self.decimals_cache.insert(TOSHI, 18);
         self.decimals_cache.insert(MIGGLES, 18);
 
-        // Preload pools for dynamic discovery comparison
-        // WETH/USDC Uniswap V3 0.05%
-        self.register_pool(address!("0xd0b53d9277642d899df5c87a3966a349a798f224"), WETH, USDC, 500, "uniswap_v3");
-        // WETH/USDC Aerodrome Slipstream CL 0.05%
-        self.register_pool(address!("0xdbc6998296caa1652a810dc8d3baf4a8294330f1"), WETH, USDC, 500, "aerodrome_cl");
+        // === WETH/USDC pools ===
+        self.register_pool(address!("d0b53d9277642d899df5c87a3966a349a798f224"), WETH, USDC, 500, "uniswap_v3");
+        self.register_pool(address!("b4cb800910b228ed3d0834cf79d697127bbb00e5"), WETH, USDC, 3000, "uniswap_v3");
+        self.register_pool(address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59"), WETH, USDC, 100, "aerodrome_cl");
+        self.register_pool(address!("dbc6998296caa1652a810dc8d3baf4a8294330f1"), WETH, USDC, 500, "aerodrome_cl");
+
+        // === BRETT/WETH pools ===
+        self.register_pool(address!("4e829f8a5213c42535ab84aa40bd4adcce9cba02"), BRETT, WETH, 10000, "aerodrome_cl");   // Slipstream 1%
+        self.register_pool(address!("ba3f945812a83471d709bce9c3ca699a19fb46f7"), BRETT, WETH, 10000, "uniswap_v3");      // Uni V3 1%
+        self.register_pool(address!("76bf0abd20f1e0155ce40a62615a90a709a6c3d8"), BRETT, WETH, 3000, "uniswap_v3");       // Uni V3 0.3%
+
+        // === DEGEN/WETH pools ===
+        self.register_pool(address!("c9034c3e7f58003e6ae0c8438e7c8f4598d5acaa"), DEGEN, WETH, 3000, "uniswap_v3");      // Uni V3 0.3%  $1.4M liquidity
+        self.register_pool(address!("2c4909355b0c036840819484c3a882a95659abf3"), DEGEN, WETH, 3000, "aerodrome_v2");     // Aero V2      $34k liquidity
+        self.register_pool(address!("afb62448929664bfccb0aae22f232520e765ba88"), DEGEN, WETH, 3000, "aerodrome_cl");     // Aero Slipstream $18k
+
+        // === AERO/USDC pools (from previous research) ===
+        self.register_pool(address!("6cDAcb3025D68e11c3e24383B69B18B3cc2F43D8"), AERO, USDC, 200, "aerodrome_cl");      // Aero Slipstream
+        self.register_pool(address!("9809e877192B0B18E1CC0a3F5110093D29B8C84A"), AERO, WETH, 3000, "aerodrome_cl");      // Aero Slipstream
+
+        info!("📋 Pool Registry loaded: {} known pools across {} pairs",
+            self.pools.len(),
+            self.pair_to_pools.len()
+        );
     }
 
     fn register_pool(&mut self, address: Address, token0: Address, token1: Address, fee: u32, dex: &str) {
