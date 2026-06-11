@@ -173,8 +173,9 @@ fn simulate_uniswap_v3_swap(
         return U256::ZERO;
     }
 
-    let fee_factor = U256::from(10000 - fee_bps);
-    let amount_in_with_fee = (amount_in * fee_factor) / U256::from(10000);
+    let fee_pips = fee_bps.min(1_000_000);
+    let fee_factor = U256::from(1_000_000 - fee_pips);
+    let amount_in_with_fee = (amount_in * fee_factor) / U256::from(1_000_000);
 
     // Uniswap V3 concentrated liquidity swap math (within tick):
     // L = liquidity
@@ -255,6 +256,42 @@ fn aerodrome_v2_pool_specs() -> Vec<V2PoolSpec> {
     ]
 }
 
+fn quote_first_tokens(token0: Address, token1: Address) -> (Address, Address) {
+    if token0 == USDC || token1 == USDC {
+        let other = if token0 == USDC { token1 } else { token0 };
+        (USDC, other)
+    } else if token0 == WETH || token1 == WETH {
+        let other = if token0 == WETH { token1 } else { token0 };
+        (WETH, other)
+    } else {
+        (token0, token1)
+    }
+}
+
+fn amount_to_usd(amount: U256, token: Address, _decimals: u32, eth_price_usd: f64) -> Option<f64> {
+    let raw = amount.to::<u128>() as f64;
+    if token == USDC {
+        Some(raw / 1e6)
+    } else if token == WETH {
+        Some((raw / 1e18) * eth_price_usd)
+    } else {
+        None
+    }
+}
+
+fn usd_to_amount(usd_val: f64, token: Address, decimals: u32, eth_price_usd: f64) -> Option<U256> {
+    let raw_val = if token == USDC {
+        usd_val * 1e6
+    } else if token == WETH {
+        (usd_val / eth_price_usd) * 1e18
+    } else {
+        let decimals_factor = 10_u128.checked_pow(decimals)?;
+        usd_val * decimals_factor as f64
+    };
+
+    Some(U256::from(raw_val as u128))
+}
+
 // --- OPTIMIZATION ALGORITHM (BINARY SEARCH) ---
 // Finds the loan size that maximizes P(L) local to revm environment.
 fn optimize_loan_size(
@@ -267,20 +304,16 @@ fn optimize_loan_size(
 ) -> (U256, f64) {
     let start_time = Instant::now();
 
+    if token_in != USDC && token_in != WETH {
+        return (U256::ZERO, 0.0);
+    }
+
     // Range in USD: $20 to $500
     let min_usd = 20.0;
     let max_usd = 500.0;
 
     let get_units = |usd_val: f64| -> U256 {
-        let decimals_factor = 10_u128.pow(token_in_decimals);
-        let raw_val = if token_in == USDC {
-            usd_val * 1e6
-        } else if token_in == WETH {
-            (usd_val / eth_price_usd) * 1e18
-        } else {
-            (usd_val / eth_price_usd) * (decimals_factor as f64)
-        };
-        U256::from(raw_val as u128)
+        usd_to_amount(usd_val, token_in, token_in_decimals, eth_price_usd).unwrap_or(U256::ZERO)
     };
 
     let calculate_profit = |L: U256| -> f64 {
@@ -331,13 +364,12 @@ fn optimize_loan_size(
 
         let gross_profit = amount_out_b - L - flash_fee;
 
-        // Convert gross profit to USD
-        let decimals_factor = 10_f64.powi(token_in_decimals as i32);
-        let gross_usd = if token_in == USDC {
-            (gross_profit.to::<u128>() as f64) / 1e6
-        } else {
-            ((gross_profit.to::<u128>() as f64) / decimals_factor) * eth_price_usd
-        };
+        let gross_usd = amount_to_usd(gross_profit, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);
+        let size_usd = amount_to_usd(L, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);
+
+        if !gross_usd.is_finite() || gross_usd <= 0.0 || gross_usd > size_usd * 3.0 {
+            return 0.0;
+        }
 
         gross_usd
     };
@@ -534,13 +566,14 @@ impl PoolRegistry {
                                 let higher = p_a.max(p_b);
                                 let lower = p_a.min(p_b);
                                 let spread = ((higher - lower) / lower) * 10000.0;
+                                let (token_in, token_out) = quote_first_tokens(token0, token1);
                                 opps.push(ArbOpportunity {
                                     pool_a: pool_address,
                                     pool_b: other_pool.address,
                                     dex_a: dex_name.to_string(),
                                     dex_b: other_pool.dex_name.clone(),
-                                    token_in: token0,
-                                    token_out: token1,
+                                    token_in,
+                                    token_out,
                                     spread_bps: spread,
                                 });
                             }
@@ -778,12 +811,7 @@ async fn main() -> Result<(), eyre::Report> {
                         println!("\n[🎯 DRY RUN OPPORTUNITY DETECTED]");
                         println!("- Path: {:?} -> {:?} -> {:?}", opp.token_in, opp.token_out, opp.token_in);
                         
-                        let decimals_factor = 10_f64.powi(dec_in as i32);
-                        let size_usd = if opp.token_in == USDC {
-                            (opt_size.to::<u128>() as f64) / 1e6
-                        } else {
-                            ((opt_size.to::<u128>() as f64) / decimals_factor) * weth_price_usd
-                        };
+                        let size_usd = amount_to_usd(opt_size, opp.token_in, dec_in, weth_price_usd).unwrap_or(0.0);
 
                         let aave_fee_usd = size_usd * 0.0005;
                         let gas_cost_usd = 0.003;
