@@ -11,7 +11,9 @@ use crate::stream::ws_listener::{
 
 pub const UNISWAP_V3_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118");
 
-pub const AERODROME_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("218a6d128cdcd0ae4e32171088781ccb541bb8cc3d89c175b28d8ce1e27e1475");
+pub const AERODROME_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e");
+
+pub const AERODROME_SLIPSTREAM_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("ab0d57f0df537bb25e80245ef7748fa62353808c54d6e528a9dd20887aed9ac2");
 
 #[derive(Debug, Clone)]
 pub struct NewPool {
@@ -110,7 +112,7 @@ impl NewPairWatcher {
                 tick_spacing: None,
                 dex_name: "aerodrome_v2".to_string(),
             })
-        } else if log.address() == AERODROME_SLIPSTREAM_FACTORY {
+        } else if log.address() == AERODROME_SLIPSTREAM_FACTORY && topic0 == AERODROME_SLIPSTREAM_POOL_CREATED_TOPIC {
             if topics.len() < 4 {
                 return Err(eyre!("Aerodrome Slipstream PoolCreated missing indexed topics"));
             }

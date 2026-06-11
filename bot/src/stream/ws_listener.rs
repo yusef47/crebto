@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
-pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d824");
+pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822");
 
 pub const UNISWAP_V3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
 pub const AERODROME_V2_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
@@ -87,14 +87,17 @@ impl WsListener {
             }
         });
 
-        // Subscribe to factory logs. PoolCreated signatures differ between
-        // Uniswap V3, Aerodrome V2, and Aerodrome Slipstream, so parsing is
-        // done downstream against the emitting factory address.
+        // Subscribe to Factory PoolCreated events for dynamic pool discovery.
         let factory_filter = Filter::new()
             .address(vec![
                 UNISWAP_V3_FACTORY,
                 AERODROME_V2_FACTORY,
                 AERODROME_SLIPSTREAM_FACTORY,
+            ])
+            .event_signature(vec![
+                crate::stream::new_pair_watcher::UNISWAP_V3_POOL_CREATED_TOPIC,
+                crate::stream::new_pair_watcher::AERODROME_POOL_CREATED_TOPIC,
+                crate::stream::new_pair_watcher::AERODROME_SLIPSTREAM_POOL_CREATED_TOPIC,
             ]);
 
         let factory_provider = provider.clone();
