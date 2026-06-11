@@ -3,26 +3,18 @@
 // Targets mid-cap/long-tail pools on Base where competition is low.
 
 use alloy::{
-    network::Ethereum,
-    primitives::{address, Address, Bytes, B256, U256},
-    providers::{Provider, ProviderBuilder, WsConnect},
-    rpc::types::eth::{Filter, Log},
+    primitives::{address, Address, B256, U256},
+    providers::{ProviderBuilder, WsConnect},
+    rpc::types::eth::Filter,
     sol,
-    transports::Transport,
 };
 use futures_util::StreamExt;
-use revm::{
-    db::{CacheDB, EmptyDB},
-    primitives::{AccountInfo, Bytecode, ExecutionResult, TransactTo},
-    Evm,
-};
-use tokio::sync::mpsc;
-use tracing::{info, warn, error, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 // --- GLOBAL SETTINGS ---
 const DRY_RUN: bool = true;
@@ -387,37 +379,39 @@ impl PoolRegistry {
     }
 
     fn update_from_swap(&mut self, pool_address: Address, sqrt_price_x96: U256, liquidity: u128, tick: i32, block: u64) -> Vec<ArbOpportunity> {
-        let mut opps = vec![];
-        if let Some(pool) = self.pools.get_mut(&pool_address) {
+        let (token0, token1, dex_name, sqrt_price_x96_val) = if let Some(pool) = self.pools.get_mut(&pool_address) {
             pool.sqrt_price_x96 = sqrt_price_x96;
             pool.liquidity = liquidity;
             pool.tick = tick;
             pool.last_update_block = block;
+            (pool.token0, pool.token1, pool.dex_name.clone(), pool.sqrt_price_x96)
+        } else {
+            return vec![];
+        };
 
-            // Check if there is another pool of the same pair to compare
-            let key = if pool.token0 < pool.token1 { (pool.token0, pool.token1) } else { (pool.token1, pool.token0) };
-            if let Some(pool_addresses) = self.pair_to_pools.get(&key) {
-                for &addr in pool_addresses {
-                    if addr != pool_address {
-                        if let Some(other_pool) = self.pools.get(&addr) {
-                            if !other_pool.sqrt_price_x96.is_zero() {
-                                // Calculate spread
-                                let p_a = sqrt_price_to_f64(pool.sqrt_price_x96);
-                                let p_b = sqrt_price_to_f64(other_pool.sqrt_price_x96);
-                                if p_a > 0.0 && p_b > 0.0 {
-                                    let higher = p_a.max(p_b);
-                                    let lower = p_a.min(p_b);
-                                    let spread = ((higher - lower) / lower) * 10000.0;
-                                    opps.push(ArbOpportunity {
-                                        pool_a: pool.address,
-                                        pool_b: other_pool.address,
-                                        dex_a: pool.dex_name.clone(),
-                                        dex_b: other_pool.dex_name.clone(),
-                                        token_in: pool.token0,
-                                        token_out: pool.token1,
-                                        spread_bps: spread,
-                                    });
-                                }
+        let mut opps = vec![];
+        let key = if token0 < token1 { (token0, token1) } else { (token1, token0) };
+        if let Some(pool_addresses) = self.pair_to_pools.get(&key) {
+            for &addr in pool_addresses {
+                if addr != pool_address {
+                    if let Some(other_pool) = self.pools.get(&addr) {
+                        if !other_pool.sqrt_price_x96.is_zero() {
+                            // Calculate spread
+                            let p_a = sqrt_price_to_f64(sqrt_price_x96_val);
+                            let p_b = sqrt_price_to_f64(other_pool.sqrt_price_x96);
+                            if p_a > 0.0 && p_b > 0.0 {
+                                let higher = p_a.max(p_b);
+                                let lower = p_a.min(p_b);
+                                let spread = ((higher - lower) / lower) * 10000.0;
+                                opps.push(ArbOpportunity {
+                                    pool_a: pool_address,
+                                    pool_b: other_pool.address,
+                                    dex_a: dex_name.clone(),
+                                    dex_b: other_pool.dex_name.clone(),
+                                    token_in: token0,
+                                    token_out: token1,
+                                    spread_bps: spread,
+                                });
                             }
                         }
                     }
@@ -524,11 +518,11 @@ async fn main() -> Result<(), eyre::Report> {
                 if topic0 == UNISWAP_V3_SWAP_TOPIC {
                     stats.uniswap_swaps.fetch_add(1, Ordering::Relaxed);
                     // Decode V3 fields from data
-                    let data = log.data();
-                    if data.len() >= 96 {
+                    let log_data = log.data();
+                    if log_data.data.len() >= 96 {
                         // Extract sqrtPriceX96 from first 32 bytes of log data
-                        sqrt_price = U256::from_be_slice(&data[0..32]);
-                        liquidity = U256::from_be_slice(&data[64..96]).to::<u128>();
+                        sqrt_price = U256::from_be_slice(&log_data.data[0..32]);
+                        liquidity = U256::from_be_slice(&log_data.data[64..96]).to::<u128>();
                     }
                 } else if topic0 == AERODROME_V2_SWAP_TOPIC {
                     stats.aerodrome_swaps.fetch_add(1, Ordering::Relaxed);
