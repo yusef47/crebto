@@ -536,12 +536,11 @@ async fn main() -> Result<(), eyre::Report> {
 
                 if topic0 == UNISWAP_V3_SWAP_TOPIC {
                     stats.uniswap_swaps.fetch_add(1, Ordering::Relaxed);
-                    // Decode V3 fields from data
                     let log_data = log.data();
-                    if log_data.data.len() >= 96 {
-                        // Extract sqrtPriceX96 from first 32 bytes of log data
-                        sqrt_price = U256::from_be_slice(&log_data.data[0..32]);
-                        liquidity = U256::from_be_slice(&log_data.data[64..96]).to::<u128>();
+                    if log_data.data.len() >= 128 {
+                        // Extract sqrtPriceX96 from [64..96] and liquidity from [96..128]
+                        sqrt_price = U256::from_be_slice(&log_data.data[64..96]);
+                        liquidity = U256::from_be_slice(&log_data.data[96..128]).to::<u128>();
                     }
                 } else if topic0 == AERODROME_V2_SWAP_TOPIC {
                     stats.aerodrome_swaps.fetch_add(1, Ordering::Relaxed);
