@@ -63,6 +63,9 @@ pub struct TrackedPool {
     pub tick_spacing: Option<i32>,
     pub dex_name: String, // "uniswap_v3" or "aerodrome_cl" or "aerodrome_v2"
     pub last_update_block: u64,
+    // V2 AMM reserve tracking
+    pub reserve0: U256,
+    pub reserve1: U256,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +84,8 @@ pub struct BotStats {
     pub opportunities_found: AtomicU64,
     pub profitable_after_fees: AtomicU64,
     pub uniswap_swaps: AtomicU64,
-    pub aerodrome_swaps: AtomicU64,
+    pub aerodrome_cl_swaps: AtomicU64,
+    pub aerodrome_v2_swaps: AtomicU64,
     pub blocks_seen: AtomicU64,
     pub consecutive_failures: AtomicU32,
     pub tracked_pools_active: AtomicU32,
@@ -95,7 +99,8 @@ impl BotStats {
             opportunities_found: AtomicU64::new(0),
             profitable_after_fees: AtomicU64::new(0),
             uniswap_swaps: AtomicU64::new(0),
-            aerodrome_swaps: AtomicU64::new(0),
+            aerodrome_cl_swaps: AtomicU64::new(0),
+            aerodrome_v2_swaps: AtomicU64::new(0),
             blocks_seen: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             tracked_pools_active: AtomicU32::new(0),
@@ -108,7 +113,8 @@ impl BotStats {
         let opps = self.opportunities_found.load(Ordering::Relaxed);
         let profitable = self.profitable_after_fees.load(Ordering::Relaxed);
         let uni = self.uniswap_swaps.load(Ordering::Relaxed);
-        let aero = self.aerodrome_swaps.load(Ordering::Relaxed);
+        let aero_cl = self.aerodrome_cl_swaps.load(Ordering::Relaxed);
+        let aero_v2 = self.aerodrome_v2_swaps.load(Ordering::Relaxed);
         let blocks = self.blocks_seen.load(Ordering::Relaxed);
         let tracked = self.tracked_pools_active.load(Ordering::Relaxed);
         let profit_cents = self.total_estimated_profit_cents.load(Ordering::Relaxed);
@@ -121,7 +127,8 @@ impl BotStats {
         info!("║ 🧱 Blocks seen: {}                               ", blocks);
         info!("║ 🔄 Total swaps detected: {}                      ", swaps);
         info!("║    ├─ Uniswap V3: {}                             ", uni);
-        info!("║    └─ Aerodrome CL/V2: {}                        ", aero);
+        info!("║    ├─ Aerodrome CL: {}                           ", aero_cl);
+        info!("║    └─ Aerodrome V2: {}                           ", aero_v2);
         info!("║ 📋 Active tracked pools: {}                      ", tracked);
         info!("║ 🎯 Arbitrage opportunities: {}                   ", opps);
         info!("║ 💰 Profitable (after fees): {}                   ", profitable);
@@ -236,9 +243,12 @@ fn optimize_loan_size(
         // 1. Swap on Pool A
         let zero_for_one_a = pool_a.token0 == token_in;
         let amount_out_a = if pool_a.dex_name == "aerodrome_v2" {
-            // Mock reserves for Aerodrome V2 based on price and a standard $100k depth
-            let reserve_in = U256::from(100_000) * get_units(1.0);
-            let reserve_out = U256::from(100_000) * get_units(1.0);
+            // Use actual tracked reserves from live V2 swap events
+            let (reserve_in, reserve_out) = if zero_for_one_a {
+                (pool_a.reserve0, pool_a.reserve1)
+            } else {
+                (pool_a.reserve1, pool_a.reserve0)
+            };
             simulate_aerodrome_v2_swap(L, reserve_in, reserve_out, pool_a.fee_bps)
         } else {
             simulate_uniswap_v3_swap(L, zero_for_one_a, pool_a.sqrt_price_x96, pool_a.liquidity, pool_a.fee_bps)
@@ -251,8 +261,11 @@ fn optimize_loan_size(
         // 2. Swap on Pool B
         let zero_for_one_b = pool_b.token0 == token_out;
         let amount_out_b = if pool_b.dex_name == "aerodrome_v2" {
-            let reserve_in = U256::from(100_000) * get_units(1.0);
-            let reserve_out = U256::from(100_000) * get_units(1.0);
+            let (reserve_in, reserve_out) = if zero_for_one_b {
+                (pool_b.reserve0, pool_b.reserve1)
+            } else {
+                (pool_b.reserve1, pool_b.reserve0)
+            };
             simulate_aerodrome_v2_swap(amount_out_a, reserve_in, reserve_out, pool_b.fee_bps)
         } else {
             simulate_uniswap_v3_swap(amount_out_a, zero_for_one_b, pool_b.sqrt_price_x96, pool_b.liquidity, pool_b.fee_bps)
@@ -393,6 +406,8 @@ impl PoolRegistry {
                 tick_spacing: None,
                 dex_name: dex.to_string(),
                 last_update_block: 0,
+                reserve0: U256::ZERO,
+                reserve1: U256::ZERO,
             },
         );
     }
@@ -408,6 +423,51 @@ impl PoolRegistry {
             return vec![];
         };
 
+        self.find_arb_opportunities(pool_address, token0, token1, &dex_name, sqrt_price_x96_val)
+    }
+
+    /// Update a V2 pool from its Swap event data (amount0In, amount1In, amount0Out, amount1Out)
+    /// and compute a synthetic sqrtPriceX96 for spread comparison with V3/CL pools.
+    fn update_from_v2_swap(&mut self, pool_address: Address, amount0_in: U256, amount1_in: U256, amount0_out: U256, amount1_out: U256, block: u64) -> Vec<ArbOpportunity> {
+        let (token0, token1, dex_name, sqrt_price_x96_val) = if let Some(pool) = self.pools.get_mut(&pool_address) {
+            // Update reserves based on swap deltas
+            // reserve_new = reserve_old + amountIn - amountOut
+            pool.reserve0 = pool.reserve0.saturating_add(amount0_in).saturating_sub(amount0_out);
+            pool.reserve1 = pool.reserve1.saturating_add(amount1_in).saturating_sub(amount1_out);
+            pool.last_update_block = block;
+
+            // Compute synthetic sqrtPriceX96 from reserves for spread comparison
+            // price = reserve1 / reserve0
+            // sqrtPriceX96 = sqrt(price) * 2^96
+            // We compute: sqrtPriceX96 = sqrt(reserve1 * 2^192 / reserve0)
+            let synthetic_sqrt = if !pool.reserve0.is_zero() && !pool.reserve1.is_zero() {
+                // Use floating point for the synthetic price (only used for spread comparison)
+                let r0 = u256_to_f64(pool.reserve0);
+                let r1 = u256_to_f64(pool.reserve1);
+                let price = r1 / r0;
+                let sqrt_price = price.sqrt();
+                let q96: f64 = (2.0_f64).powi(96);
+                let val = sqrt_price * q96;
+                U256::from(val as u128)
+            } else {
+                U256::ZERO
+            };
+
+            pool.sqrt_price_x96 = synthetic_sqrt;
+
+            (pool.token0, pool.token1, pool.dex_name.clone(), synthetic_sqrt)
+        } else {
+            return vec![];
+        };
+
+        if sqrt_price_x96_val.is_zero() {
+            return vec![];
+        }
+
+        self.find_arb_opportunities(pool_address, token0, token1, &dex_name, sqrt_price_x96_val)
+    }
+
+    fn find_arb_opportunities(&self, pool_address: Address, token0: Address, token1: Address, dex_name: &str, sqrt_price_x96_val: U256) -> Vec<ArbOpportunity> {
         let mut opps = vec![];
         let key = if token0 < token1 { (token0, token1) } else { (token1, token0) };
         if let Some(pool_addresses) = self.pair_to_pools.get(&key) {
@@ -425,7 +485,7 @@ impl PoolRegistry {
                                 opps.push(ArbOpportunity {
                                     pool_a: pool_address,
                                     pool_b: other_pool.address,
-                                    dex_a: dex_name.clone(),
+                                    dex_a: dex_name.to_string(),
                                     dex_b: other_pool.dex_name.clone(),
                                     token_in: token0,
                                     token_out: token1,
@@ -532,28 +592,56 @@ async fn main() -> Result<(), eyre::Report> {
                 let pool_address = log.address();
                 let topic0 = topics[0];
 
-                let mut sqrt_price = U256::ZERO;
-                let mut liquidity = 0u128;
-                let mut tick = 0i32;
+                // Determine which event type this is and decode accordingly
+                let opportunities = if topic0 == UNISWAP_V3_SWAP_TOPIC {
+                    // This covers both Uniswap V3 AND Aerodrome CL (Slipstream) pools
+                    // since they emit the exact same Swap event signature
+                    let is_aero_cl = registry.pools.get(&pool_address)
+                        .map(|p| p.dex_name == "aerodrome_cl")
+                        .unwrap_or(false);
 
-                if topic0 == UNISWAP_V3_SWAP_TOPIC {
-                    stats.uniswap_swaps.fetch_add(1, Ordering::Relaxed);
+                    if is_aero_cl {
+                        stats.aerodrome_cl_swaps.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats.uniswap_swaps.fetch_add(1, Ordering::Relaxed);
+                    }
+
                     let log_data = log.data();
                     if log_data.data.len() >= 128 {
-                        // Extract sqrtPriceX96 from [64..96] and liquidity from [96..128]
-                        sqrt_price = U256::from_be_slice(&log_data.data[64..96]);
-                        liquidity = U256::from_be_slice(&log_data.data[96..128]).to::<u128>();
-                        info!("DECODED SWAP: pool={:?}, sqrt_price={}, liquidity={}", pool_address, sqrt_price, liquidity);
+                        // V3/CL layout: amount0(32) | amount1(32) | sqrtPriceX96(32) | liquidity(32) | tick(32)
+                        let sqrt_price = U256::from_be_slice(&log_data.data[64..96]);
+                        let liquidity = U256::from_be_slice(&log_data.data[96..128]).to::<u128>();
+
+                        if sqrt_price.is_zero() {
+                            continue;
+                        }
+
+                        registry.update_from_swap(pool_address, sqrt_price, liquidity, 0, current_block)
+                    } else {
+                        continue;
                     }
                 } else if topic0 == AERODROME_V2_SWAP_TOPIC {
-                    stats.aerodrome_swaps.fetch_add(1, Ordering::Relaxed);
-                }
+                    // Aerodrome V2 (Uniswap V2-style) layout:
+                    // data: amount0In(32) | amount1In(32) | amount0Out(32) | amount1Out(32)
+                    stats.aerodrome_v2_swaps.fetch_add(1, Ordering::Relaxed);
 
-                if sqrt_price.is_zero() {
+                    let log_data = log.data();
+                    if log_data.data.len() >= 128 {
+                        let amount0_in  = U256::from_be_slice(&log_data.data[0..32]);
+                        let amount1_in  = U256::from_be_slice(&log_data.data[32..64]);
+                        let amount0_out = U256::from_be_slice(&log_data.data[64..96]);
+                        let amount1_out = U256::from_be_slice(&log_data.data[96..128]);
+
+                        info!("DECODED V2 SWAP: pool={:?}, a0in={}, a1in={}, a0out={}, a1out={}",
+                            pool_address, amount0_in, amount1_in, amount0_out, amount1_out);
+
+                        registry.update_from_v2_swap(pool_address, amount0_in, amount1_in, amount0_out, amount1_out, current_block)
+                    } else {
+                        continue;
+                    }
+                } else {
                     continue;
-                }
-
-                let opportunities = registry.update_from_swap(pool_address, sqrt_price, liquidity, tick, current_block);
+                };
 
                 for opp in opportunities {
                     stats.opportunities_found.fetch_add(1, Ordering::Relaxed);
