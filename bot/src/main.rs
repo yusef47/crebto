@@ -28,7 +28,7 @@ use config::Config;
 // const GAS_LIMIT: u64 = 600_000;
 // const BASE_FEE_WEI: u64 = 5_000_000; // ~0.005 gwei typical Base gas
 
-pub const CHAINLINK_ETH_USD: Address = address!("71041dd95c07bf0a3597d52a2333068D25f38Bb7");
+pub const CHAINLINK_ETH_USD: Address = address!("71041dddad356df2e01399310d6b3f67c3071b60");
 
 // --- VERIFIED EVENT SIGNATURES (KECCAK-256) ---
 pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
@@ -62,7 +62,7 @@ sol! {
 
     #[sol(rpc)]
     interface IChainlinkPriceFeed {
-        function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
+        function latestAnswer() external view returns (int256 answer);
     }
 
     #[sol(rpc)]
@@ -244,18 +244,16 @@ fn simulate_aerodrome_v2_swap(
     numerator / denominator
 }
 
-fn sqrt_price_x96_from_reserves(reserve0: U256, reserve1: U256, dec0: u32, dec1: u32) -> U256 {
+fn sqrt_price_x96_from_reserves(reserve0: U256, reserve1: U256) -> U256 {
     if reserve0.is_zero() || reserve1.is_zero() {
         return U256::ZERO;
     }
 
     let r0 = u256_to_f64(reserve0);
     let r1 = u256_to_f64(reserve1);
-    // Adjust for decimals: actual price = (r1 / 10^dec1) / (r0 / 10^dec0)
-    let dec0_factor = 10_f64.powi(dec0 as i32);
-    let dec1_factor = 10_f64.powi(dec1 as i32);
-    let adjusted_ratio = (r1 / r0) * (dec0_factor / dec1_factor);
-    let sqrt_price = adjusted_ratio.sqrt();
+    // raw ratio = reserve1 / reserve0 (no decimal adjustment — same as V3 sqrtPriceX96 convention)
+    let raw_ratio = r1 / r0;
+    let sqrt_price = raw_ratio.sqrt();
     let q96: f64 = (2.0_f64).powi(96);
     U256::from((sqrt_price * q96) as u128)
 }
@@ -382,11 +380,9 @@ fn optimize_loan_size(
         let gross_profit = amount_out_b - L - flash_fee;
 
         let gross_usd = amount_to_usd(gross_profit, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);
-        let size_usd = amount_to_usd(L, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);
-
-        if !gross_usd.is_finite() || gross_usd <= 0.0 || gross_usd > size_usd * 3.0 {
-            return 0.0;
-        }
+        let size_usd = amount_to_usd(L, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);                        if !gross_usd.is_finite() || gross_usd <= 0.0 || gross_usd > size_usd * 0.05 {
+                            return 0.0;
+                        }
 
         gross_usd
     };
@@ -533,10 +529,8 @@ impl PoolRegistry {
             entry.push(address);
         }
 
-        let dec0 = self.decimals_cache.get(&token0).cloned().unwrap_or(18);
-        let dec1 = self.decimals_cache.get(&token1).cloned().unwrap_or(18);
         let sqrt_price_x96 = if dex == "aerodrome_v2" {
-            sqrt_price_x96_from_reserves(reserve0, reserve1, dec0, dec1)
+            sqrt_price_x96_from_reserves(reserve0, reserve1)
         } else {
             U256::ZERO
         };
@@ -585,9 +579,7 @@ impl PoolRegistry {
             pool.last_update_block = block;
 
             // Compute synthetic sqrtPriceX96 from reserves for spread comparison.
-            let dec0 = self.decimals_cache.get(&pool.token0).cloned().unwrap_or(18);
-            let dec1 = self.decimals_cache.get(&pool.token1).cloned().unwrap_or(18);
-            let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1, dec0, dec1);
+            let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1);
             pool.sqrt_price_x96 = synthetic_sqrt;
 
             (pool.token0, pool.token1, pool.dex_name.clone(), synthetic_sqrt)
@@ -605,28 +597,42 @@ impl PoolRegistry {
     fn find_arb_opportunities(&self, pool_address: Address, token0: Address, token1: Address, dex_name: &str, sqrt_price_x96_val: U256) -> Vec<ArbOpportunity> {
         let mut opps = vec![];
         let key = if token0 < token1 { (token0, token1) } else { (token1, token0) };
+        let dec0 = self.decimals_cache.get(&token0).cloned().unwrap_or(18);
+        let dec1 = self.decimals_cache.get(&token1).cloned().unwrap_or(18);
         if let Some(pool_addresses) = self.pair_to_pools.get(&key) {
             for &addr in pool_addresses {
                 if addr != pool_address {
                     if let Some(other_pool) = self.pools.get(&addr) {
                         if !other_pool.sqrt_price_x96.is_zero() {
-                            // Calculate spread
-                            let p_a = sqrt_price_to_f64(sqrt_price_x96_val);
-                            let p_b = sqrt_price_to_f64(other_pool.sqrt_price_x96);
-                            if p_a > 0.0 && p_b > 0.0 {
+                            // Calculate spread with normalized prices
+                            let p_a = sqrt_price_to_f64(sqrt_price_x96_val, dec0, dec1);
+                            let other_dec0 = self.decimals_cache.get(&other_pool.token0).cloned().unwrap_or(18);
+                            let other_dec1 = self.decimals_cache.get(&other_pool.token1).cloned().unwrap_or(18);
+                            let mut p_b = sqrt_price_to_f64(other_pool.sqrt_price_x96, other_dec0, other_dec1);
+
+                            // If the other pool has opposite token ordering, invert its price
+                            // so both prices represent the same direction (token1/token0 of the reference pool)
+                            if other_pool.token0 != token0 && p_b > 0.0 && p_b.is_finite() {
+                                p_b = 1.0 / p_b;
+                            }
+
+                            if p_a > 0.0 && p_b > 0.0 && p_a.is_finite() && p_b.is_finite() {
                                 let higher = p_a.max(p_b);
                                 let lower = p_a.min(p_b);
                                 let spread = ((higher - lower) / lower) * 10000.0;
-                                let (token_in, token_out) = quote_first_tokens(token0, token1);
-                                opps.push(ArbOpportunity {
-                                    pool_a: pool_address,
-                                    pool_b: other_pool.address,
-                                    dex_a: dex_name.to_string(),
-                                    dex_b: other_pool.dex_name.clone(),
-                                    token_in,
-                                    token_out,
-                                    spread_bps: spread,
-                                });
+                                // Only report if spread is realistic (not caused by math errors)
+                                if spread.is_finite() && spread > 0.0 && spread < 10000.0 {
+                                    let (token_in, token_out) = quote_first_tokens(token0, token1);
+                                    opps.push(ArbOpportunity {
+                                        pool_a: pool_address,
+                                        pool_b: other_pool.address,
+                                        dex_a: dex_name.to_string(),
+                                        dex_b: other_pool.dex_name.clone(),
+                                        token_in,
+                                        token_out,
+                                        spread_bps: spread,
+                                    });
+                                }
                             }
                         }
                     }
@@ -637,11 +643,13 @@ impl PoolRegistry {
     }
 }
 
-fn sqrt_price_to_f64(sqrt_price_x96: U256) -> f64 {
+fn sqrt_price_to_f64(sqrt_price_x96: U256, dec0: u32, dec1: u32) -> f64 {
     let q96: f64 = (2.0_f64).powi(96);
     let sqrt_val = u256_to_f64(sqrt_price_x96);
     let ratio = sqrt_val / q96;
-    ratio * ratio
+    let raw_price = ratio * ratio;
+    // Adjust for decimals: actual price = (token1 / 10^dec1) / (token0 / 10^dec0)
+    raw_price * (10_f64.powi(dec0 as i32) / 10_f64.powi(dec1 as i32))
 }
 
 fn u256_to_f64(v: U256) -> f64 {
@@ -688,7 +696,7 @@ async fn main() -> Result<(), eyre::Report> {
     let weth_price_usd = Arc::new(RwLock::new(2500.0));
     {
         let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider.as_ref());
-        match price_feed.latestRoundData().call().await {
+        match price_feed.latestAnswer().call().await {
             Ok(result) => {
                 let answer_i128: i128 = result.answer.into_raw().to::<u128>() as i128;
                 if answer_i128 > 0 {
@@ -713,7 +721,7 @@ async fn main() -> Result<(), eyre::Report> {
         loop {
             interval.tick().await;
             let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider_clone.as_ref());
-            match price_feed.latestRoundData().call().await {
+            match price_feed.latestAnswer().call().await {
                 Ok(result) => {
                     let answer_i128: i128 = result.answer.into_raw().to::<u128>() as i128;
                     if answer_i128 > 0 {
