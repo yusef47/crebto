@@ -103,6 +103,8 @@ pub struct TrackedPool {
     // V2 AMM reserve tracking
     pub reserve0: U256,
     pub reserve1: U256,
+    // True for Aerodrome V2 stable pools (curve-based, not constant-product)
+    pub stable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -592,7 +594,7 @@ impl PoolRegistry {
     }
 
     fn register_pool(&mut self, address: Address, token0: Address, token1: Address, fee: u32, dex: &str) {
-        self.register_pool_with_state(address, token0, token1, fee, dex, U256::ZERO, U256::ZERO);
+        self.register_pool_with_state(address, token0, token1, fee, dex, U256::ZERO, U256::ZERO, false);
     }
 
     fn register_pool_with_state(
@@ -604,6 +606,7 @@ impl PoolRegistry {
         dex: &str,
         reserve0: U256,
         reserve1: U256,
+        stable: bool,
     ) {
         let key = if token0 < token1 { (token0, token1) } else { (token1, token0) };
         let entry = self.pair_to_pools.entry(key).or_default();
@@ -632,6 +635,7 @@ impl PoolRegistry {
                 last_update_block: 0,
                 reserve0,
                 reserve1,
+                stable,
             },
         );
     }
@@ -850,6 +854,7 @@ async fn main() -> Result<(), eyre::Report> {
                     "aerodrome_v2",
                     reserve0,
                     reserve1,
+                    spec.stable,
                 );
                 info!(
                     "Loaded Aerodrome V2 {} pool {:?}: token0={:?}, token1={:?}, r0={}, r1={}",
@@ -869,9 +874,11 @@ async fn main() -> Result<(), eyre::Report> {
     let weth_price_usd = Arc::new(RwLock::new(2500.0));
     let mut price_oracle_pool: Option<Address> = None;
 
-    // Look for the WETH/USDC V2 pool we just loaded to use as price oracle
+    // Look for the WETH/USDC V2 volatile pool we just loaded to use as price oracle.
+    // Only use volatile pools (stable==false) — stable pools use a curve-based AMM
+    // where reserve ratio does NOT equal market price, so they give wildly wrong prices.
     for (addr, pool) in &registry.pools {
-        if pool.dex_name == "aerodrome_v2" {
+        if pool.dex_name == "aerodrome_v2" && !pool.stable {
             let pair = if pool.token0 < pool.token1 { (pool.token0, pool.token1) } else { (pool.token1, pool.token0) };
             if pair == (WETH, USDC) {
                 price_oracle_pool = Some(*addr);
