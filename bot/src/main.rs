@@ -5,6 +5,7 @@
 use alloy::{
     primitives::{address, Address, B256, U256},
     providers::{Provider, ProviderBuilder, WsConnect},
+    pubsub::PubSubFrontend,
     rpc::types::eth::Filter,
     sol,
 };
@@ -285,7 +286,7 @@ fn quote_first_tokens(token0: Address, token1: Address) -> (Address, Address) {
 }
 
 fn amount_to_usd(amount: U256, token: Address, _decimals: u32, eth_price_usd: f64) -> Option<f64> {
-    let raw = amount.as_u128() as f64;
+    let raw = amount.to::<u128>() as f64;
     if token == USDC {
         Some(raw / 1e6)
     } else if token == WETH {
@@ -482,7 +483,7 @@ impl PoolRegistry {
         );
     }
 
-    async fn warm_decimals<P: Provider>(&mut self, provider: &P) {
+    async fn warm_decimals<P: Provider<PubSubFrontend>>(&mut self, provider: &P) {
         let tokens: Vec<Address> = self.pools.values()
             .flat_map(|p| [p.token0, p.token1])
             .filter(|t| !self.decimals_cache.contains_key(t))
@@ -496,7 +497,7 @@ impl PoolRegistry {
             let contract = IERC20::new(token, provider);
             futures.push(async move {
                 match contract.decimals().call().await {
-                    Ok(result) => (token, result.decimals as u32),
+                    Ok(result) => (token, result._0 as u32),
                     Err(_) => (token, 18),
                 }
             });
@@ -584,8 +585,8 @@ impl PoolRegistry {
             pool.last_update_block = block;
 
             // Compute synthetic sqrtPriceX96 from reserves for spread comparison.
-            let dec0 = self.decimals_cache.get(&token0).cloned().unwrap_or(18);
-            let dec1 = self.decimals_cache.get(&token1).cloned().unwrap_or(18);
+            let dec0 = self.decimals_cache.get(&pool.token0).cloned().unwrap_or(18);
+            let dec1 = self.decimals_cache.get(&pool.token1).cloned().unwrap_or(18);
             let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1, dec0, dec1);
             pool.sqrt_price_x96 = synthetic_sqrt;
 
@@ -689,7 +690,7 @@ async fn main() -> Result<(), eyre::Report> {
         let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider.as_ref());
         match price_feed.latestRoundData().call().await {
             Ok(result) => {
-                let answer_i128 = result.answer.as_i128();
+                let answer_i128: i128 = result.answer.into_raw().to::<u128>() as i128;
                 if answer_i128 > 0 {
                     let price = answer_i128 as f64 / 1e8;
                     info!("🔗 Chainlink ETH/USD price: ${:.2}", price);
@@ -714,7 +715,7 @@ async fn main() -> Result<(), eyre::Report> {
             let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider_clone.as_ref());
             match price_feed.latestRoundData().call().await {
                 Ok(result) => {
-                    let answer_i128 = result.answer.as_i128();
+                    let answer_i128: i128 = result.answer.into_raw().to::<u128>() as i128;
                     if answer_i128 > 0 {
                         let price = answer_i128 as f64 / 1e8;
                         *price_clone.write().await = price;
@@ -735,7 +736,7 @@ async fn main() -> Result<(), eyre::Report> {
             interval.tick().await;
             match provider_clone.get_gas_price().await {
                 Ok(price) => {
-                    gas_price_clone.store(price.as_u128() as u64, Ordering::Relaxed);
+                    gas_price_clone.store(price.to::<u128>() as u64, Ordering::Relaxed);
                 }
                 Err(_) => {}
             }
@@ -801,7 +802,7 @@ async fn main() -> Result<(), eyre::Report> {
                         let token_contract = IERC20::new(token, provider.as_ref());
                         match token_contract.decimals().call().await {
                             Ok(result) => {
-                                registry.decimals_cache.insert(token, result.decimals as u32);
+                                registry.decimals_cache.insert(token, result._0 as u32);
                             }
                             Err(_) => {
                                 registry.decimals_cache.insert(token, 18);
