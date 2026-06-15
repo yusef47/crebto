@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
-pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822");
+pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("b3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b");
+pub const AERODROME_V2_SYNC_TOPIC: B256 = alloy::primitives::b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
 
 pub const UNISWAP_V3_FACTORY: Address = address!("33128a8fC17869897dcE68Ed026d694621f6FDfD");
 pub const AERODROME_V2_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
@@ -66,6 +67,7 @@ impl WsListener {
             .event_signature(vec![
                 UNISWAP_V3_SWAP_TOPIC,
                 AERODROME_V2_SWAP_TOPIC,
+                AERODROME_V2_SYNC_TOPIC,
             ]);
 
         let log_provider = provider.clone();

@@ -32,7 +32,8 @@ pub const CHAINLINK_ETH_USD: Address = address!("71041dddad356df2e01399310d6b3f6
 
 // --- VERIFIED EVENT SIGNATURES (KECCAK-256) ---
 pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
-pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822");
+pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("b3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b");
+pub const AERODROME_V2_SYNC_TOPIC: B256 = alloy::primitives::b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
 
 pub const UNISWAP_V3_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118");
 pub const AERODROME_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e");
@@ -594,6 +595,20 @@ impl PoolRegistry {
         self.find_arb_opportunities(pool_address, token0, token1, &dex_name, sqrt_price_x96_val)
     }
 
+    /// Update a V2 pool from its Sync event data (reserve0, reserve1).
+    /// The Sync event is emitted on every swap and mint/burn, so it serves as a reliable
+    /// fallback to keep reserves up-to-date even if the Swap event is missed.
+    fn update_from_v2_sync(&mut self, pool_address: Address, reserve0: U256, reserve1: U256, block: u64) {
+        if let Some(pool) = self.pools.get_mut(&pool_address) {
+            pool.reserve0 = reserve0;
+            pool.reserve1 = reserve1;
+            pool.last_update_block = block;
+
+            let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1);
+            pool.sqrt_price_x96 = synthetic_sqrt;
+        }
+    }
+
     fn find_arb_opportunities(&self, pool_address: Address, token0: Address, token1: Address, dex_name: &str, sqrt_price_x96_val: U256) -> Vec<ArbOpportunity> {
         let mut opps = vec![];
         let key = if token0 < token1 { (token0, token1) } else { (token1, token0) };
@@ -869,6 +884,7 @@ async fn main() -> Result<(), eyre::Report> {
         .event_signature(vec![
             UNISWAP_V3_SWAP_TOPIC,
             AERODROME_V2_SWAP_TOPIC,
+            AERODROME_V2_SYNC_TOPIC,
         ]);
 
     let mut sub_logs = provider.subscribe_logs(&filter).await?.into_stream();
@@ -885,8 +901,6 @@ async fn main() -> Result<(), eyre::Report> {
                 stats.blocks_seen.fetch_add(1, Ordering::Relaxed);
             }
             Some(log) = sub_logs.next() => {
-                stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
-
                 // Decode log parameters
                 let topics = log.topics();
                 if topics.len() < 1 { continue; }
@@ -895,9 +909,11 @@ async fn main() -> Result<(), eyre::Report> {
                 let topic0 = topics[0];
 
                 // Determine which event type this is and decode accordingly
-                let opportunities = if topic0 == UNISWAP_V3_SWAP_TOPIC {
+                let mut opportunities = Vec::new();
+                if topic0 == UNISWAP_V3_SWAP_TOPIC {
                     // This covers both Uniswap V3 AND Aerodrome CL (Slipstream) pools
                     // since they emit the exact same Swap event signature
+                    stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
                     let is_aero_cl = registry.pools.get(&pool_address)
                         .map(|p| p.dex_name == "aerodrome_cl")
                         .unwrap_or(false);
@@ -914,17 +930,15 @@ async fn main() -> Result<(), eyre::Report> {
                         let sqrt_price = U256::from_be_slice(&log_data.data[64..96]);
                         let liquidity = U256::from_be_slice(&log_data.data[96..128]).to::<u128>();
 
-                        if sqrt_price.is_zero() {
-                            continue;
+                        if !sqrt_price.is_zero() {
+                            opportunities = registry.update_from_swap(pool_address, sqrt_price, liquidity, 0, current_block);
                         }
-
-                        registry.update_from_swap(pool_address, sqrt_price, liquidity, 0, current_block)
-                    } else {
-                        continue;
                     }
                 } else if topic0 == AERODROME_V2_SWAP_TOPIC {
-                    // Aerodrome V2 (Uniswap V2-style) layout:
+                    // Aerodrome V2 Swap event:
+                    // topics: [SwapTopic, sender, to]
                     // data: amount0In(32) | amount1In(32) | amount0Out(32) | amount1Out(32)
+                    stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
                     stats.aerodrome_v2_swaps.fetch_add(1, Ordering::Relaxed);
 
                     let log_data = log.data();
@@ -934,16 +948,24 @@ async fn main() -> Result<(), eyre::Report> {
                         let amount0_out = U256::from_be_slice(&log_data.data[64..96]);
                         let amount1_out = U256::from_be_slice(&log_data.data[96..128]);
 
-                        info!("DECODED V2 SWAP: pool={:?}, a0in={}, a1in={}, a0out={}, a1out={}",
-                            pool_address, amount0_in, amount1_in, amount0_out, amount1_out);
-
-                        registry.update_from_v2_swap(pool_address, amount0_in, amount1_in, amount0_out, amount1_out, current_block)
-                    } else {
-                        continue;
+                        opportunities = registry.update_from_v2_swap(pool_address, amount0_in, amount1_in, amount0_out, amount1_out, current_block);
                     }
+                } else if topic0 == AERODROME_V2_SYNC_TOPIC {
+                    // Aerodrome V2 Sync event:
+                    // topics: [SyncTopic]
+                    // data: reserve0(32) | reserve1(32)
+                    // Sync is emitted on every swap, so it keeps reserves fresh even if we miss the Swap event.
+                    // We do NOT count this as a swap or trigger opportunities — it just updates reserves.
+                    let log_data = log.data();
+                    if log_data.data.len() >= 64 {
+                        let reserve0 = U256::from_be_slice(&log_data.data[0..32]);
+                        let reserve1 = U256::from_be_slice(&log_data.data[32..64]);
+                        registry.update_from_v2_sync(pool_address, reserve0, reserve1, current_block);
+                    }
+                    continue; // Skip opportunity processing for Sync events
                 } else {
                     continue;
-                };
+                }
 
                 // Use cached dynamic gas price (updated in background task)
                 let gas_cost_usd = (gas_price_wei.load(Ordering::Relaxed) as f64
