@@ -736,7 +736,7 @@ async fn main() -> Result<(), eyre::Report> {
             interval.tick().await;
             match provider_clone.get_gas_price().await {
                 Ok(price) => {
-                    gas_price_clone.store(price.to::<u128>() as u64, Ordering::Relaxed);
+                    gas_price_clone.store(price as u64, Ordering::Relaxed);
                 }
                 Err(_) => {}
             }
