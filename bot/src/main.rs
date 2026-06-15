@@ -1,6 +1,7 @@
 // Production-ready, high-performance, and self-contained Crebto Arbitrage Bot
 // Built for Base Layer-2 Network (2026)
-// Targets mid-cap/long-tail pools on Base where competition is low.
+// v0.6: Dynamic Shadow Sniper — auto-discovers long-tail/meme pools
+//        with honeypot/tax safety filters and live trading config.
 
 use alloy::{
     primitives::{address, Address, B256, U256},
@@ -20,6 +21,11 @@ use tokio::sync::RwLock;
 
 mod config;
 use config::Config;
+
+mod discovery;
+mod safety;
+use discovery::PoolDiscovery;
+use safety::{TokenSafetyChecker, TokenSafety};
 
 // --- GLOBAL SETTINGS ---
 // These are now loaded from Config. Fallbacks removed.
@@ -77,15 +83,6 @@ sol! {
         function token1() external view returns (address token);
         function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint32 blockTimestampLast);
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct V2PoolSpec {
-    token_a: Address,
-    token_b: Address,
-    stable: bool,
-    fee_bps: u32,
-    label: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -261,19 +258,6 @@ fn sqrt_price_x96_from_reserves(reserve0: U256, reserve1: U256) -> U256 {
     U256::from((sqrt_price * q96) as u128)
 }
 
-fn aerodrome_v2_pool_specs() -> Vec<V2PoolSpec> {
-    vec![
-        V2PoolSpec { token_a: WETH, token_b: USDC, stable: true,  fee_bps: 4,  label: "WETH/USDC stable" },
-        V2PoolSpec { token_a: WETH, token_b: USDC, stable: false, fee_bps: 30, label: "WETH/USDC volatile" },
-        V2PoolSpec { token_a: AERO, token_b: USDC, stable: false, fee_bps: 30, label: "AERO/USDC volatile" },
-        V2PoolSpec { token_a: AERO, token_b: WETH, stable: false, fee_bps: 30, label: "AERO/WETH volatile" },
-        V2PoolSpec { token_a: BRETT, token_b: WETH, stable: false, fee_bps: 30, label: "BRETT/WETH volatile" },
-        V2PoolSpec { token_a: DEGEN, token_b: WETH, stable: false, fee_bps: 30, label: "DEGEN/WETH volatile" },
-        V2PoolSpec { token_a: TOSHI, token_b: WETH, stable: false, fee_bps: 30, label: "TOSHI/WETH volatile" },
-        V2PoolSpec { token_a: MIGGLES, token_b: WETH, stable: false, fee_bps: 30, label: "MIGGLES/WETH volatile" },
-    ]
-}
-
 fn quote_first_tokens(token0: Address, token1: Address) -> (Address, Address) {
     if token0 == USDC || token1 == USDC {
         let other = if token0 == USDC { token1 } else { token0 };
@@ -297,6 +281,7 @@ fn amount_to_usd(amount: U256, token: Address, _decimals: u32, eth_price_usd: f6
     }
 }
 
+#[allow(dead_code)]
 fn usd_to_amount(usd_val: f64, token: Address, decimals: u32, eth_price_usd: f64) -> Option<U256> {
     let raw_val = if token == USDC {
         usd_val * 1e6
@@ -772,7 +757,8 @@ async fn main() -> Result<(), eyre::Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("╔══════════════════════════════════════════════╗");
-    info!("║    🚀 Starting Crebto Arbitrage Bot v0.5    ║");
+    info!("║    🚀 Starting Crebto Arbitrage Bot v0.6    ║");
+    info!("║    🕵️‍♂️ Shadow Sniper Mode: Long-Tail/Meme   ║");
     info!("╚══════════════════════════════════════════════╝");
 
     // Load configuration from environment
@@ -795,80 +781,91 @@ async fn main() -> Result<(), eyre::Report> {
     info!("DRY RUN MODE: {}", config.dry_run);
     info!("Connecting to configured WSS stream");
 
-    info!("Connected successfully. Loading Aerodrome V2 pools from router...");
+    info!("Connected successfully. Discovering Aerodrome V2 pools dynamically...");
 
-    let router = IAerodromeRouter::new(AERODROME_V2_ROUTER, provider.as_ref());
-    for spec in aerodrome_v2_pool_specs() {
-        match router.poolFor(spec.token_a, spec.token_b, spec.stable, AERODROME_V2_FACTORY).call().await {
-            Ok(pool_result) if pool_result.pool != ZERO_ADDRESS => {
-                let v2_pool = IAerodromeV2Pool::new(pool_result.pool, provider.as_ref());
-                let token0 = match v2_pool.token0().call().await {
-                    Ok(result) => result.token,
-                    Err(err) => {
-                        warn!("Aerodrome V2 {} skipped: token0() failed for {:?}: {}", spec.label, pool_result.pool, err);
-                        continue;
-                    }
-                };
-                let token1 = match v2_pool.token1().call().await {
-                    Ok(result) => result.token,
-                    Err(err) => {
-                        warn!("Aerodrome V2 {} skipped: token1() failed for {:?}: {}", spec.label, pool_result.pool, err);
-                        continue;
-                    }
-                };
-                let reserves = match v2_pool.getReserves().call().await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        warn!("Aerodrome V2 {} skipped: getReserves() failed for {:?}: {}", spec.label, pool_result.pool, err);
-                        continue;
-                    }
-                };
-                let reserve0 = reserves.reserve0;
-                let reserve1 = reserves.reserve1;
+    // Seed tokens for long-tail discovery (WETH/USDC pairs + meme coins)
+    let seed_tokens = vec![WETH, USDC, AERO, BRETT, DEGEN, TOSHI, MIGGLES];
 
-                if reserve0.is_zero() || reserve1.is_zero() {
-                    warn!("Aerodrome V2 {} skipped: empty reserves at {:?}", spec.label, pool_result.pool);
-                    continue;
-                }
+    // Initial WETH price for liquidity estimation (will be refined later)
+    let initial_weth_price = 1719.0;
 
-                // Warm decimals for newly discovered tokens
-                for token in [token0, token1] {
-                    if !registry.decimals_cache.contains_key(&token) {
-                        let token_contract = IERC20::new(token, provider.as_ref());
-                        match token_contract.decimals().call().await {
-                            Ok(result) => {
-                                registry.decimals_cache.insert(token, result._0 as u32);
-                            }
-                            Err(_) => {
-                                registry.decimals_cache.insert(token, 18);
-                            }
-                        }
+    // Discover all V2 pools with sufficient liquidity
+    let discovered = PoolDiscovery::discover_long_tail_pairs(
+        provider.as_ref(),
+        &seed_tokens,
+        initial_weth_price,
+        config.min_liquidity_usd,
+    ).await;
+
+    info!("🔍 Discovered {} pools with >${:.2} liquidity", discovered.len(), config.min_liquidity_usd);
+
+    // Initialize safety checker
+    let safety_checker = TokenSafetyChecker::new(config.max_tax_bps, config.min_liquidity_usd);
+    let mut safe_pools = 0;
+    let mut rejected_pools = 0;
+
+    for pool in discovered {
+        // Fetch decimals for both tokens if not already cached
+        for token in [pool.token0, pool.token1] {
+            if !registry.decimals_cache.contains_key(&token) {
+                let token_contract = IERC20::new(token, provider.as_ref());
+                match token_contract.decimals().call().await {
+                    Ok(result) => {
+                        registry.decimals_cache.insert(token, result._0 as u32);
+                    }
+                    Err(_) => {
+                        registry.decimals_cache.insert(token, 18);
                     }
                 }
-
-                registry.register_pool_with_state(
-                    pool_result.pool,
-                    token0,
-                    token1,
-                    spec.fee_bps,
-                    "aerodrome_v2",
-                    reserve0,
-                    reserve1,
-                    spec.stable,
-                );
-                info!(
-                    "Loaded Aerodrome V2 {} pool {:?}: token0={:?}, token1={:?}, r0={}, r1={}",
-                    spec.label, pool_result.pool, token0, token1, reserve0, reserve1
-                );
-            }
-            Ok(_) => {
-                info!("Aerodrome V2 {} pool not found by router", spec.label);
-            }
-            Err(err) => {
-                warn!("Aerodrome V2 {} router lookup failed: {}", spec.label, err);
             }
         }
+
+        let dec0 = registry.decimals_cache.get(&pool.token0).copied().unwrap_or(18);
+        let dec1 = registry.decimals_cache.get(&pool.token1).copied().unwrap_or(18);
+
+        // Run safety checks on both tokens
+        let (safety0, safety1) = safety_checker.check_pair(
+            provider.as_ref(),
+            pool.token0,
+            pool.token1,
+            dec0,
+            dec1,
+            pool.reserve0,
+            pool.reserve1,
+            initial_weth_price,
+        ).await;
+
+        if safety0 != TokenSafety::Safe || safety1 != TokenSafety::Safe {
+            warn!(
+                "🚫 Pool {} rejected: token0={:?} ({:?}), token1={:?} ({:?})",
+                pool.address, pool.token0, safety0, pool.token1, safety1
+            );
+            rejected_pools += 1;
+            continue;
+        }
+
+        // Register the safe pool
+        registry.register_pool_with_state(
+            pool.address,
+            pool.token0,
+            pool.token1,
+            pool.fee_bps,
+            "aerodrome_v2",
+            pool.reserve0,
+            pool.reserve1,
+            pool.stable,
+        );
+        info!(
+            "✅ Safe pool registered: {} at {:?} (token0={:?}, token1={:?}, liquidity=${:.2})",
+            pool.label, pool.address, pool.token0, pool.token1, pool.liquidity_usd
+        );
+        safe_pools += 1;
     }
+
+    info!(
+        "🏁 Discovery complete: {} safe pools registered, {} rejected (honeypot/high-tax/low-liq)",
+        safe_pools, rejected_pools
+    );
 
     // Fetch initial WETH price from a WETH/USDC V2 volatile pool (more reliable than Chainlink on Base)
     let weth_price_usd = Arc::new(RwLock::new(2500.0));

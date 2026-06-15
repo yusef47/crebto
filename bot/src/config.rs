@@ -26,6 +26,11 @@ pub struct Config {
     pub execution_gas_limit: u64,
     pub slippage_bps: u32,
     pub probe_sizes_usd: Vec<f64>,
+    // v0.6: Safety & live trading controls
+    pub min_liquidity_usd: f64,
+    pub max_tax_bps: u32,
+    pub max_daily_loss_usd: f64,
+    pub max_trades_per_hour: u32,
 }
 
 impl Config {
@@ -122,11 +127,32 @@ impl Config {
             .unwrap_or(15);
 
         let probe_sizes_usd = env::var("PROBE_SIZES_USD")
-            .unwrap_or_else(|_| "10,50,100,200".to_string())
+            .unwrap_or_else(|_| "50,100".to_string())
             .split(',')
             .filter_map(|raw| raw.trim().parse::<f64>().ok())
             .filter(|value| *value > 0.0)
             .collect::<Vec<_>>();
+
+        // v0.6 safety & live trading defaults
+        let min_liquidity_usd = env::var("MIN_LIQUIDITY_USD")
+            .unwrap_or_else(|_| "5000".to_string())
+            .parse::<f64>()
+            .unwrap_or(5000.0);
+
+        let max_tax_bps = env::var("MAX_TAX_BPS")
+            .unwrap_or_else(|_| "500".to_string())
+            .parse::<u32>()
+            .unwrap_or(500);
+
+        let max_daily_loss_usd = env::var("MAX_DAILY_LOSS_USD")
+            .unwrap_or_else(|_| "10.0".to_string())
+            .parse::<f64>()
+            .unwrap_or(10.0);
+
+        let max_trades_per_hour = env::var("MAX_TRADES_PER_HOUR")
+            .unwrap_or_else(|_| "5".to_string())
+            .parse::<u32>()
+            .unwrap_or(5);
 
         Ok(Self {
             alchemy_wss,
@@ -151,6 +177,10 @@ impl Config {
             execution_gas_limit,
             slippage_bps,
             probe_sizes_usd,
+            min_liquidity_usd,
+            max_tax_bps,
+            max_daily_loss_usd,
+            max_trades_per_hour,
         })
     }
 }

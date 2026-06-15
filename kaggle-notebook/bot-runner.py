@@ -32,6 +32,11 @@ SECRET_NAMES = [
     "PROBE_SIZES_USD",
     "TELEGRAM_BOT_TOKEN",
     "TELEGRAM_CHAT_ID",
+    # v0.6 safety & live trading secrets
+    "MIN_LIQUIDITY_USD",
+    "MAX_TAX_BPS",
+    "MAX_DAILY_LOSS_USD",
+    "MAX_TRADES_PER_HOUR",
 ]
 
 DEFAULTS = {
@@ -45,7 +50,12 @@ DEFAULTS = {
     "MIN_PROFIT_USD": "0.20",
     "EXECUTION_GAS_LIMIT": "600000",
     "SLIPPAGE_BPS": "15",
-    "PROBE_SIZES_USD": "10,50,100,200",
+    "PROBE_SIZES_USD": "50,100",
+    # v0.6: Safety & live trading defaults
+    "MIN_LIQUIDITY_USD": "5000",
+    "MAX_TAX_BPS": "500",
+    "MAX_DAILY_LOSS_USD": "10.0",
+    "MAX_TRADES_PER_HOUR": "5",
 }
 
 MASKED_NAMES = {
