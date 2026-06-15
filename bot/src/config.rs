@@ -80,9 +80,9 @@ impl Config {
             .unwrap_or(50);
 
         let min_profit_usd = env::var("MIN_PROFIT_USD")
-            .unwrap_or_else(|_| "1.0".to_string())
+            .unwrap_or_else(|_| "0.20".to_string())
             .parse::<f64>()
-            .unwrap_or(1.0);
+            .unwrap_or(0.20);
 
         let require_simulation = env::var("REQUIRE_SIMULATION")
             .unwrap_or_else(|_| "true".to_string())
@@ -117,9 +117,9 @@ impl Config {
             .unwrap_or(600_000);
 
         let slippage_bps = env::var("SLIPPAGE_BPS")
-            .unwrap_or_else(|_| "50".to_string())
+            .unwrap_or_else(|_| "15".to_string())
             .parse::<u32>()
-            .unwrap_or(50);
+            .unwrap_or(15);
 
         let probe_sizes_usd = env::var("PROBE_SIZES_USD")
             .unwrap_or_else(|_| "10,50,100,200".to_string())

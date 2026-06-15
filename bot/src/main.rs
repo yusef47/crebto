@@ -308,8 +308,60 @@ fn usd_to_amount(usd_val: f64, token: Address, decimals: u32, eth_price_usd: f64
     Some(U256::from(raw_val as u128))
 }
 
-// --- OPTIMIZATION ALGORITHM (BINARY SEARCH) ---
-// Finds the loan size that maximizes P(L) local to revm environment.
+/// Pre-cache the USD→token conversion factor to avoid recomputing in simulation loops.
+fn usd_conversion_factor(token: Address, decimals: u32, eth_price_usd: f64) -> f64 {
+    let factor = if token == USDC {
+        1e6
+    } else if token == WETH {
+        1e18 / eth_price_usd
+    } else {
+        10_u128.pow(decimals) as f64
+    };
+    // Clamp to prevent overflow when eth_price_usd is pathologically small
+    factor.min(1e22)
+}
+
+/// Check if a token pair includes a volatile meme coin.
+/// Meme coins have higher profit sanity caps (20% vs 5%) to allow catching flash crashes.
+fn is_meme_coin_pair(token0: Address, token1: Address) -> bool {
+    let meme_coins = [BRETT, DEGEN, TOSHI, MIGGLES];
+    meme_coins.contains(&token0) || meme_coins.contains(&token1)
+}
+
+/// Calculate price impact for a swap input on a given pool.
+/// For V2: exact formula = amount_in / (reserve_in + amount_in)
+/// For V3/CL: conservative approximation using liquidity as depth proxy.
+///   V3 liquidity is concentrated in ticks; a large swap traverses multiple
+///   ticks with decreasing liquidity. The actual impact is typically 2–5× higher
+///   than the simple amount/liquidity ratio. We apply a 3× safety multiplier.
+fn calculate_price_impact(pool: &TrackedPool, amount_in: U256, token_in: Address) -> f64 {
+    if pool.dex_name == "aerodrome_v2" {
+        let reserve_in = if pool.token0 == token_in {
+            pool.reserve0
+        } else {
+            pool.reserve1
+        };
+        let amount = u256_to_f64(amount_in);
+        let reserve = u256_to_f64(reserve_in);
+        if reserve + amount <= 0.0 {
+            return 1.0;
+        }
+        amount / (reserve + amount)
+    } else {
+        // V3/CL: use liquidity as a proxy for depth with 3× conservative multiplier
+        let amount = u256_to_f64(amount_in);
+        let liquidity = pool.liquidity as f64;
+        if liquidity == 0.0 {
+            return 1.0;
+        }
+        let base_impact = amount / (liquidity + amount);
+        (base_impact * 3.0).min(1.0)
+    }
+}
+
+// --- OPTIMIZATION ALGORITHM (BINARY SEARCH WITH PRICE IMPACT) ---
+// Finds the optimal flash loan size between $10 and $1000 that maximizes net profit
+// while keeping price impact on both pools below 5%.
 fn optimize_loan_size(
     pool_a: &TrackedPool,
     pool_b: &TrackedPool,
@@ -317,6 +369,7 @@ fn optimize_loan_size(
     token_out: Address,
     token_in_decimals: u32,
     eth_price_usd: f64,
+    gas_cost_usd: f64,
 ) -> (U256, f64) {
     let start_time = Instant::now();
 
@@ -324,38 +377,72 @@ fn optimize_loan_size(
         return (U256::ZERO, 0.0);
     }
 
-    // Range in USD: $20 to $500
-    let min_usd = 20.0;
-    let max_usd = 500.0;
+    // Binary search range: $10 to $1,000
+    let min_usd = 10.0;
+    let max_usd = 1000.0;
+    let max_price_impact = 0.05; // 5%
+
+    // Pre-cache the USD→token conversion factor to avoid recomputing in every iteration
+    let conversion_factor = usd_conversion_factor(token_in, token_in_decimals, eth_price_usd);
 
     let get_units = |usd_val: f64| -> U256 {
-        usd_to_amount(usd_val, token_in, token_in_decimals, eth_price_usd).unwrap_or(U256::ZERO)
+        U256::from((usd_val * conversion_factor) as u128)
     };
 
-    let calculate_profit = |L: U256| -> f64 {
-        if L.is_zero() {
-            return 0.0;
+    // Meme coin pairs have higher profit sanity cap (30% vs 5%)
+    // 30% catches legitimate 5–25% flash-crash spreads while rejecting extreme outliers
+    let max_profit_ratio = if is_meme_coin_pair(token_in, token_out) {
+        0.30
+    } else {
+        0.05
+    };
+
+    let mut low = min_usd;
+    let mut high = max_usd;
+    let mut best_size = U256::ZERO;
+    let mut best_profit = 0.0;
+
+    // 8 iterations of binary search for convergence
+    for iter in 0..8 {
+        // Early exit: if no profitable size found after 4 iterations and we're near the floor,
+        // this spread is likely below breakeven for all sizes — stop wasting cycles.
+        if iter >= 4 && best_profit <= 0.0 && (high - low) < 50.0 {
+            break;
+        }
+        let mid = (low + high) / 2.0;
+        let size = get_units(mid);
+
+        if size.is_zero() {
+            break;
         }
 
-        // 1. Swap on Pool A
+        // 1. Simulate swap on Pool A
         let zero_for_one_a = pool_a.token0 == token_in;
         let amount_out_a = if pool_a.dex_name == "aerodrome_v2" {
-            // Use actual tracked reserves from live V2 swap events
             let (reserve_in, reserve_out) = if zero_for_one_a {
                 (pool_a.reserve0, pool_a.reserve1)
             } else {
                 (pool_a.reserve1, pool_a.reserve0)
             };
-            simulate_aerodrome_v2_swap(L, reserve_in, reserve_out, pool_a.fee_bps)
+            simulate_aerodrome_v2_swap(size, reserve_in, reserve_out, pool_a.fee_bps)
         } else {
-            simulate_uniswap_v3_swap(L, zero_for_one_a, pool_a.sqrt_price_x96, pool_a.liquidity, pool_a.fee_bps)
+            simulate_uniswap_v3_swap(size, zero_for_one_a, pool_a.sqrt_price_x96, pool_a.liquidity, pool_a.fee_bps)
         };
 
         if amount_out_a.is_zero() {
-            return 0.0;
+            high = mid;
+            continue;
         }
 
-        // 2. Swap on Pool B
+        // 2. Check price impact on Pool A
+        let impact_a = calculate_price_impact(pool_a, size, token_in);
+        if impact_a > max_price_impact {
+            // Too large for pool A depth — reduce upper bound
+            high = mid;
+            continue;
+        }
+
+        // 3. Simulate swap on Pool B
         let zero_for_one_b = pool_b.token0 == token_out;
         let amount_out_b = if pool_b.dex_name == "aerodrome_v2" {
             let (reserve_in, reserve_out) = if zero_for_one_b {
@@ -368,59 +455,53 @@ fn optimize_loan_size(
             simulate_uniswap_v3_swap(amount_out_a, zero_for_one_b, pool_b.sqrt_price_x96, pool_b.liquidity, pool_b.fee_bps)
         };
 
-        if amount_out_b <= L {
-            return 0.0;
+        if amount_out_b.is_zero() {
+            high = mid;
+            continue;
         }
 
-        // 3. Subtract Flash Loan Fee (0.05% = 5 bps)
-        let flash_fee = (L * U256::from(5)) / U256::from(10000);
-        if amount_out_b <= L + flash_fee {
-            return 0.0;
+        // 4. Check price impact on Pool B (using intermediate token as input)
+        let impact_b = calculate_price_impact(pool_b, amount_out_a, token_out);
+        if impact_b > max_price_impact {
+            // Too large for pool B depth — reduce upper bound
+            high = mid;
+            continue;
         }
 
-        let gross_profit = amount_out_b - L - flash_fee;
+        // 5. Calculate net profit after flash loan fee (0.05% = 5 bps)
+        let flash_fee = (size * U256::from(5)) / U256::from(10000);
+        if amount_out_b <= size + flash_fee {
+            low = mid;
+            continue;
+        }
 
+        let gross_profit = amount_out_b - size - flash_fee;
         let gross_usd = amount_to_usd(gross_profit, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);
-        let size_usd = amount_to_usd(L, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);                        if !gross_usd.is_finite() || gross_usd <= 0.0 || gross_usd > size_usd * 0.05 {
-                            return 0.0;
-                        }
+        let size_usd = amount_to_usd(size, token_in, token_in_decimals, eth_price_usd).unwrap_or(0.0);
 
-        gross_usd
-    };
+        // 6. Sanity cap: meme coins allow 20%, stablecoins 5%
+        if !gross_usd.is_finite() || gross_usd <= 0.0 || gross_usd > size_usd * max_profit_ratio {
+            low = mid;
+            continue;
+        }
 
-    // Binary search on the trade size range
-    let mut low = min_usd;
-    let mut high = max_usd;
-    let mut best_size = U256::ZERO;
-    let mut best_profit = 0.0;
+        // 7. Net profit after gas
+        let net_profit = gross_usd - gas_cost_usd;
 
-    for _ in 0..12 {
-        let mid1 = low + (high - low) / 3.0;
-        let mid2 = high - (high - low) / 3.0;
+        if net_profit > best_profit {
+            best_profit = net_profit;
+            best_size = size;
+        }
 
-        let size1 = get_units(mid1);
-        let size2 = get_units(mid2);
-
-        let profit1 = calculate_profit(size1);
-        let profit2 = calculate_profit(size2);
-
-        if profit1 > profit2 {
-            if profit1 > best_profit {
-                best_profit = profit1;
-                best_size = size1;
-            }
-            high = mid2;
+        // 8. Binary search direction: if profitable, try larger; if not, try smaller
+        if net_profit > 0.0 {
+            low = mid;
         } else {
-            if profit2 > best_profit {
-                best_profit = profit2;
-                best_size = size2;
-            }
-            low = mid1;
+            high = mid;
         }
     }
 
     let elapsed = start_time.elapsed().as_secs_f64() * 1000.0;
-    // Log target under 1ms
     if elapsed > 1.0 {
         warn!("Simulation took {:.4} ms (target < 1 ms)", elapsed);
     }
@@ -687,7 +768,7 @@ async fn main() -> Result<(), eyre::Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("╔══════════════════════════════════════════════╗");
-    info!("║    🚀 Starting Crebto Arbitrage Bot v0.4    ║");
+    info!("║    🚀 Starting Crebto Arbitrage Bot v0.5    ║");
     info!("╚══════════════════════════════════════════════╝");
 
     // Load configuration from environment
@@ -986,26 +1067,24 @@ async fn main() -> Result<(), eyre::Report> {
                     // Perform local EVM simulation and Dynamic Binary Search optimization
                     let sim_start = Instant::now();
                     let (opt_size, opt_profit_usd) = optimize_loan_size(
-                        pool_a, pool_b, opp.token_in, opp.token_out, dec_in, weth_price
+                        pool_a, pool_b, opp.token_in, opp.token_out, dec_in, weth_price, gas_cost_usd
                     );
                     let sim_time_ms = sim_start.elapsed().as_secs_f64() * 1000.0;
 
+                    // opt_profit_usd is already net of flash loan fees, pool fees, and gas costs
                     if opt_profit_usd >= config.min_profit_usd {
                         stats.profitable_after_fees.fetch_add(1, Ordering::Relaxed);
                         stats.total_estimated_profit_cents.fetch_add((opt_profit_usd * 100.0) as u64, Ordering::Relaxed);
 
                         let size_usd = amount_to_usd(opt_size, opp.token_in, dec_in, weth_price).unwrap_or(0.0);
-
                         let aave_fee_usd = size_usd * 0.0005;
-                        let net_profit_usd = opt_profit_usd - aave_fee_usd - gas_cost_usd;
 
                         println!("\n[🎯 DRY RUN OPPORTUNITY DETECTED]");
                         println!("- Path: {:?} -> {:?} -> {:?}", opp.token_in, opp.token_out, opp.token_in);
                         println!("- Optimal Flash Loan Size: ${:.2}", size_usd);
                         println!("- Aave V3 Fee (0.05%): ${:.4}", aave_fee_usd);
                         println!("- Estimated Gas Cost: ${:.4} (Base L2 dynamic)", gas_cost_usd);
-                        println!("- Projected Gross Profit: ${:.2}", opt_profit_usd);
-                        println!("- Projected NET PROFIT to Wallet: ${:.2}", net_profit_usd);
+                        println!("- Projected NET PROFIT to Wallet: ${:.2}", opt_profit_usd);
                         println!("- Latency (Simulation Time): {:.4} ms\n", sim_time_ms);
                     }
                 }
