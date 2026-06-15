@@ -692,44 +692,64 @@ async fn main() -> Result<(), eyre::Report> {
     registry.warm_decimals(provider.as_ref()).await;
     info!("🔢 Decimals warmed for {} tokens", registry.decimals_cache.len());
 
-    // Fetch initial WETH price from Chainlink
+    // Fetch initial WETH price from a WETH/USDC V2 volatile pool (more reliable than Chainlink on Base)
     let weth_price_usd = Arc::new(RwLock::new(2500.0));
-    {
-        let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider.as_ref());
-        match price_feed.latestAnswer().call().await {
-            Ok(result) => {
-                let answer_i128: i128 = result.answer.into_raw().to::<u128>() as i128;
-                if answer_i128 > 0 {
-                    let price = answer_i128 as f64 / 1e8;
-                    info!("🔗 Chainlink ETH/USD price: ${:.2}", price);
-                    *weth_price_usd.write().await = price;
-                } else {
-                    warn!("⚠️ Chainlink returned negative/invalid price, using fallback 2500");
-                }
-            }
-            Err(e) => {
-                warn!("⚠️ Failed to fetch Chainlink price, using fallback 2500: {}", e);
+    let mut price_oracle_pool: Option<Address> = None;
+
+    // Look for the WETH/USDC volatile pool we just loaded to use as price oracle
+    for (addr, pool) in &registry.pools {
+        if pool.dex_name == "aerodrome_v2" {
+            let pair = if pool.token0 < pool.token1 { (pool.token0, pool.token1) } else { (pool.token1, pool.token0) };
+            if pair == (WETH, USDC) {
+                price_oracle_pool = Some(*addr);
+                break;
             }
         }
     }
 
-    // Spawn periodic WETH price update task
+    if let Some(oracle) = price_oracle_pool {
+        let v2_pool = IAerodromeV2Pool::new(oracle, provider.as_ref());
+        match v2_pool.getReserves().call().await {
+            Ok(reserves) => {
+                let r0 = reserves.reserve0.to::<u128>() as f64;
+                let r1 = reserves.reserve1.to::<u128>() as f64;
+                let price = (r1 / 1e6) / (r0 / 1e18);
+                if price > 0.0 && price.is_finite() {
+                    info!("🔗 ETH/USD price from V2 pool: ${:.2}", price);
+                    *weth_price_usd.write().await = price;
+                } else {
+                    warn!("⚠️ V2 pool returned invalid price, using fallback 2500");
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to fetch price from V2 pool, using fallback 2500: {}", e);
+            }
+        }
+    } else {
+        warn!("⚠️ No WETH/USDC V2 pool found for price oracle, using fallback 2500");
+    }
+
+    // Spawn periodic WETH price update task from the same V2 pool
     let price_clone = weth_price_usd.clone();
     let provider_clone = provider.clone();
+    let oracle_clone = price_oracle_pool;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider_clone.as_ref());
-            match price_feed.latestAnswer().call().await {
-                Ok(result) => {
-                    let answer_i128: i128 = result.answer.into_raw().to::<u128>() as i128;
-                    if answer_i128 > 0 {
-                        let price = answer_i128 as f64 / 1e8;
-                        *price_clone.write().await = price;
+            if let Some(oracle) = oracle_clone {
+                let v2_pool = IAerodromeV2Pool::new(oracle, provider_clone.as_ref());
+                match v2_pool.getReserves().call().await {
+                    Ok(reserves) => {
+                        let r0 = reserves.reserve0.to::<u128>() as f64;
+                        let r1 = reserves.reserve1.to::<u128>() as f64;
+                        let price = (r1 / 1e6) / (r0 / 1e18);
+                        if price > 0.0 && price.is_finite() {
+                            *price_clone.write().await = price;
+                        }
                     }
+                    Err(_) => {}
                 }
-                Err(_) => {}
             }
         }
     });
