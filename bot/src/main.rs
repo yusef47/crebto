@@ -692,11 +692,88 @@ async fn main() -> Result<(), eyre::Report> {
     registry.warm_decimals(provider.as_ref()).await;
     info!("🔢 Decimals warmed for {} tokens", registry.decimals_cache.len());
 
+    info!("DRY RUN MODE: {}", config.dry_run);
+    info!("Connecting to configured WSS stream");
+
+    info!("Connected successfully. Loading Aerodrome V2 pools from router...");
+
+    let router = IAerodromeRouter::new(AERODROME_V2_ROUTER, provider.as_ref());
+    for spec in aerodrome_v2_pool_specs() {
+        match router.poolFor(spec.token_a, spec.token_b, spec.stable, AERODROME_V2_FACTORY).call().await {
+            Ok(pool_result) if pool_result.pool != ZERO_ADDRESS => {
+                let v2_pool = IAerodromeV2Pool::new(pool_result.pool, provider.as_ref());
+                let token0 = match v2_pool.token0().call().await {
+                    Ok(result) => result.token,
+                    Err(err) => {
+                        warn!("Aerodrome V2 {} skipped: token0() failed for {:?}: {}", spec.label, pool_result.pool, err);
+                        continue;
+                    }
+                };
+                let token1 = match v2_pool.token1().call().await {
+                    Ok(result) => result.token,
+                    Err(err) => {
+                        warn!("Aerodrome V2 {} skipped: token1() failed for {:?}: {}", spec.label, pool_result.pool, err);
+                        continue;
+                    }
+                };
+                let reserves = match v2_pool.getReserves().call().await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        warn!("Aerodrome V2 {} skipped: getReserves() failed for {:?}: {}", spec.label, pool_result.pool, err);
+                        continue;
+                    }
+                };
+                let reserve0 = reserves.reserve0;
+                let reserve1 = reserves.reserve1;
+
+                if reserve0.is_zero() || reserve1.is_zero() {
+                    warn!("Aerodrome V2 {} skipped: empty reserves at {:?}", spec.label, pool_result.pool);
+                    continue;
+                }
+
+                // Warm decimals for newly discovered tokens
+                for token in [token0, token1] {
+                    if !registry.decimals_cache.contains_key(&token) {
+                        let token_contract = IERC20::new(token, provider.as_ref());
+                        match token_contract.decimals().call().await {
+                            Ok(result) => {
+                                registry.decimals_cache.insert(token, result._0 as u32);
+                            }
+                            Err(_) => {
+                                registry.decimals_cache.insert(token, 18);
+                            }
+                        }
+                    }
+                }
+
+                registry.register_pool_with_state(
+                    pool_result.pool,
+                    token0,
+                    token1,
+                    spec.fee_bps,
+                    "aerodrome_v2",
+                    reserve0,
+                    reserve1,
+                );
+                info!(
+                    "Loaded Aerodrome V2 {} pool {:?}: token0={:?}, token1={:?}, r0={}, r1={}",
+                    spec.label, pool_result.pool, token0, token1, reserve0, reserve1
+                );
+            }
+            Ok(_) => {
+                info!("Aerodrome V2 {} pool not found by router", spec.label);
+            }
+            Err(err) => {
+                warn!("Aerodrome V2 {} router lookup failed: {}", spec.label, err);
+            }
+        }
+    }
+
     // Fetch initial WETH price from a WETH/USDC V2 volatile pool (more reliable than Chainlink on Base)
     let weth_price_usd = Arc::new(RwLock::new(2500.0));
     let mut price_oracle_pool: Option<Address> = None;
 
-    // Look for the WETH/USDC volatile pool we just loaded to use as price oracle
+    // Look for the WETH/USDC V2 pool we just loaded to use as price oracle
     for (addr, pool) in &registry.pools {
         if pool.dex_name == "aerodrome_v2" {
             let pair = if pool.token0 < pool.token1 { (pool.token0, pool.token1) } else { (pool.token1, pool.token0) };
@@ -784,83 +861,6 @@ async fn main() -> Result<(), eyre::Report> {
             info!("🔗 Current ETH/USD price: ${:.2}", price);
         }
     });
-
-    info!("DRY RUN MODE: {}", config.dry_run);
-    info!("Connecting to configured WSS stream");
-
-    info!("Connected successfully. Loading Aerodrome V2 pools from router...");
-
-    let router = IAerodromeRouter::new(AERODROME_V2_ROUTER, provider.as_ref());
-    for spec in aerodrome_v2_pool_specs() {
-        match router.poolFor(spec.token_a, spec.token_b, spec.stable, AERODROME_V2_FACTORY).call().await {
-            Ok(pool_result) if pool_result.pool != ZERO_ADDRESS => {
-                let v2_pool = IAerodromeV2Pool::new(pool_result.pool, provider.as_ref());
-                let token0 = match v2_pool.token0().call().await {
-                    Ok(result) => result.token,
-                    Err(err) => {
-                        warn!("Aerodrome V2 {} skipped: token0() failed for {:?}: {}", spec.label, pool_result.pool, err);
-                        continue;
-                    }
-                };
-                let token1 = match v2_pool.token1().call().await {
-                    Ok(result) => result.token,
-                    Err(err) => {
-                        warn!("Aerodrome V2 {} skipped: token1() failed for {:?}: {}", spec.label, pool_result.pool, err);
-                        continue;
-                    }
-                };
-                let reserves = match v2_pool.getReserves().call().await {
-                    Ok(result) => result,
-                    Err(err) => {
-                        warn!("Aerodrome V2 {} skipped: getReserves() failed for {:?}: {}", spec.label, pool_result.pool, err);
-                        continue;
-                    }
-                };
-                let reserve0 = reserves.reserve0;
-                let reserve1 = reserves.reserve1;
-
-                if reserve0.is_zero() || reserve1.is_zero() {
-                    warn!("Aerodrome V2 {} skipped: empty reserves at {:?}", spec.label, pool_result.pool);
-                    continue;
-                }
-
-                // Warm decimals for newly discovered tokens
-                for token in [token0, token1] {
-                    if !registry.decimals_cache.contains_key(&token) {
-                        let token_contract = IERC20::new(token, provider.as_ref());
-                        match token_contract.decimals().call().await {
-                            Ok(result) => {
-                                registry.decimals_cache.insert(token, result._0 as u32);
-                            }
-                            Err(_) => {
-                                registry.decimals_cache.insert(token, 18);
-                            }
-                        }
-                    }
-                }
-
-                registry.register_pool_with_state(
-                    pool_result.pool,
-                    token0,
-                    token1,
-                    spec.fee_bps,
-                    "aerodrome_v2",
-                    reserve0,
-                    reserve1,
-                );
-                info!(
-                    "Loaded Aerodrome V2 {} pool {:?}: token0={:?}, token1={:?}, r0={}, r1={}",
-                    spec.label, pool_result.pool, token0, token1, reserve0, reserve1
-                );
-            }
-            Ok(_) => {
-                info!("Aerodrome V2 {} pool not found by router", spec.label);
-            }
-            Err(err) => {
-                warn!("Aerodrome V2 {} router lookup failed: {}", spec.label, err);
-            }
-        }
-    }
 
     info!("Subscribing to events for {} tracked pools...", registry.pools.len());
 
