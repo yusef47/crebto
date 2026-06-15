@@ -15,12 +15,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 use std::collections::HashMap;
+use tokio::sync::RwLock;
+
+mod config;
+use config::Config;
 
 // --- GLOBAL SETTINGS ---
-const DRY_RUN: bool = true;
-const MIN_PROFIT_USD: f64 = 1.0;
-const GAS_LIMIT: u64 = 600_000;
-const BASE_FEE_WEI: u64 = 5_000_000; // ~0.005 gwei typical Base gas
+// These are now loaded from Config. Fallbacks removed.
+// const DRY_RUN: bool = true;
+// const MIN_PROFIT_USD: f64 = 1.0;
+// const GAS_LIMIT: u64 = 600_000;
+// const BASE_FEE_WEI: u64 = 5_000_000; // ~0.005 gwei typical Base gas
+
+pub const CHAINLINK_ETH_USD: Address = address!("71041dd95c07bf0a3597d52a2333068D25f38Bb7");
 
 // --- VERIFIED EVENT SIGNATURES (KECCAK-256) ---
 pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
@@ -50,6 +57,11 @@ sol! {
     interface IERC20 {
         function decimals() external view returns (uint8);
         function symbol() external view returns (string);
+    }
+
+    #[sol(rpc)]
+    interface IChainlinkPriceFeed {
+        function latestRoundData() external view returns (uint80 roundId, int256 answer, uint256 startedAt, uint256 updatedAt, uint80 answeredInRound);
     }
 
     #[sol(rpc)]
@@ -231,14 +243,18 @@ fn simulate_aerodrome_v2_swap(
     numerator / denominator
 }
 
-fn sqrt_price_x96_from_reserves(reserve0: U256, reserve1: U256) -> U256 {
+fn sqrt_price_x96_from_reserves(reserve0: U256, reserve1: U256, dec0: u32, dec1: u32) -> U256 {
     if reserve0.is_zero() || reserve1.is_zero() {
         return U256::ZERO;
     }
 
     let r0 = u256_to_f64(reserve0);
     let r1 = u256_to_f64(reserve1);
-    let sqrt_price = (r1 / r0).sqrt();
+    // Adjust for decimals: actual price = (r1 / 10^dec1) / (r0 / 10^dec0)
+    let dec0_factor = 10_f64.powi(dec0 as i32);
+    let dec1_factor = 10_f64.powi(dec1 as i32);
+    let adjusted_ratio = (r1 / r0) * (dec0_factor / dec1_factor);
+    let sqrt_price = adjusted_ratio.sqrt();
     let q96: f64 = (2.0_f64).powi(96);
     U256::from((sqrt_price * q96) as u128)
 }
@@ -269,7 +285,7 @@ fn quote_first_tokens(token0: Address, token1: Address) -> (Address, Address) {
 }
 
 fn amount_to_usd(amount: U256, token: Address, _decimals: u32, eth_price_usd: f64) -> Option<f64> {
-    let raw = amount.to::<u128>() as f64;
+    let raw = amount.as_u128() as f64;
     if token == USDC {
         Some(raw / 1e6)
     } else if token == WETH {
@@ -466,6 +482,36 @@ impl PoolRegistry {
         );
     }
 
+    async fn warm_decimals<P: Provider>(&mut self, provider: &P) {
+        let tokens: Vec<Address> = self.pools.values()
+            .flat_map(|p| [p.token0, p.token1])
+            .filter(|t| !self.decimals_cache.contains_key(t))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Fetch all decimals in parallel for speed
+        let mut futures = Vec::new();
+        for token in tokens.clone() {
+            let contract = IERC20::new(token, provider);
+            futures.push(async move {
+                match contract.decimals().call().await {
+                    Ok(result) => (token, result.decimals as u32),
+                    Err(_) => (token, 18),
+                }
+            });
+        }
+        let results = futures_util::future::join_all(futures).await;
+        for (token, decimals) in results {
+            if decimals == 18 {
+                warn!("⚠️ Failed to fetch decimals for {:?}, defaulting to 18", token);
+            } else {
+                info!("🔢 Decimals for {:?}: {}", token, decimals);
+            }
+            self.decimals_cache.insert(token, decimals);
+        }
+    }
+
     fn register_pool(&mut self, address: Address, token0: Address, token1: Address, fee: u32, dex: &str) {
         self.register_pool_with_state(address, token0, token1, fee, dex, U256::ZERO, U256::ZERO);
     }
@@ -486,8 +532,10 @@ impl PoolRegistry {
             entry.push(address);
         }
 
+        let dec0 = self.decimals_cache.get(&token0).cloned().unwrap_or(18);
+        let dec1 = self.decimals_cache.get(&token1).cloned().unwrap_or(18);
         let sqrt_price_x96 = if dex == "aerodrome_v2" {
-            sqrt_price_x96_from_reserves(reserve0, reserve1)
+            sqrt_price_x96_from_reserves(reserve0, reserve1, dec0, dec1)
         } else {
             U256::ZERO
         };
@@ -536,7 +584,9 @@ impl PoolRegistry {
             pool.last_update_block = block;
 
             // Compute synthetic sqrtPriceX96 from reserves for spread comparison.
-            let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1);
+            let dec0 = self.decimals_cache.get(&token0).cloned().unwrap_or(18);
+            let dec1 = self.decimals_cache.get(&token1).cloned().unwrap_or(18);
+            let synthetic_sqrt = sqrt_price_x96_from_reserves(pool.reserve0, pool.reserve1, dec0, dec1);
             pool.sqrt_price_x96 = synthetic_sqrt;
 
             (pool.token0, pool.token1, pool.dex_name.clone(), synthetic_sqrt)
@@ -613,37 +663,101 @@ async fn main() -> Result<(), eyre::Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("╔══════════════════════════════════════════════╗");
-    info!("║    🚀 Starting Crebto Arbitrage Bot v0.3    ║");
+    info!("║    🚀 Starting Crebto Arbitrage Bot v0.4    ║");
     info!("╚══════════════════════════════════════════════╝");
 
-    // Load WSS URL from environment variables (Kaggle/GitHub secrets only).
-    let wss_url = std::env::var("ALCHEMY_WSS")
-        .or_else(|_| std::env::var("BASE_WSS_URL"))
-        .map_err(|_| eyre::eyre!("Set ALCHEMY_WSS or BASE_WSS_URL before starting the bot"))?;
-
-    let weth_price_usd = 2500.0; // Dynamic or fallback price
+    // Load configuration from environment
+    let config = Config::load_from_env()?;
+    let wss_url = config.alchemy_wss.clone();
 
     let mut registry = PoolRegistry::new();
     let stats = Arc::new(BotStats::new());
     let start_time = Instant::now();
 
+    // Connect to provider
+    let ws = WsConnect::new(&wss_url);
+    let provider = ProviderBuilder::new().on_ws(ws).await?;
+    let provider = Arc::new(provider);
+
+    // Warm decimals for all tracked tokens from on-chain
+    registry.warm_decimals(provider.as_ref()).await;
+    info!("🔢 Decimals warmed for {} tokens", registry.decimals_cache.len());
+
+    // Fetch initial WETH price from Chainlink
+    let weth_price_usd = Arc::new(RwLock::new(2500.0));
+    {
+        let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider.as_ref());
+        match price_feed.latestRoundData().call().await {
+            Ok(result) => {
+                let answer_i128 = result.answer.as_i128();
+                if answer_i128 > 0 {
+                    let price = answer_i128 as f64 / 1e8;
+                    info!("🔗 Chainlink ETH/USD price: ${:.2}", price);
+                    *weth_price_usd.write().await = price;
+                } else {
+                    warn!("⚠️ Chainlink returned negative/invalid price, using fallback 2500");
+                }
+            }
+            Err(e) => {
+                warn!("⚠️ Failed to fetch Chainlink price, using fallback 2500: {}", e);
+            }
+        }
+    }
+
+    // Spawn periodic WETH price update task
+    let price_clone = weth_price_usd.clone();
+    let provider_clone = provider.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let price_feed = IChainlinkPriceFeed::new(CHAINLINK_ETH_USD, provider_clone.as_ref());
+            match price_feed.latestRoundData().call().await {
+                Ok(result) => {
+                    let answer_i128 = result.answer.as_i128();
+                    if answer_i128 > 0 {
+                        let price = answer_i128 as f64 / 1e8;
+                        *price_clone.write().await = price;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
+    // Spawn periodic gas price update task
+    let gas_price_wei = Arc::new(AtomicU64::new(50_000_000));
+    let gas_price_clone = gas_price_wei.clone();
+    let provider_clone = provider.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            match provider_clone.get_gas_price().await {
+                Ok(price) => {
+                    gas_price_clone.store(price.as_u128() as u64, Ordering::Relaxed);
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
     // Spawn report thread
     let stats_clone = stats.clone();
+    let price_for_report = weth_price_usd.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
             let elapsed = start_time.elapsed().as_secs();
+            let price = *price_for_report.read().await;
             stats_clone.print_report(elapsed);
+            info!("🔗 Current ETH/USD price: ${:.2}", price);
         }
     });
 
-    info!("DRY RUN MODE: {}", DRY_RUN);
+    info!("DRY RUN MODE: {}", config.dry_run);
     info!("Connecting to configured WSS stream");
-
-    let ws = WsConnect::new(&wss_url);
-    let provider = ProviderBuilder::new().on_ws(ws).await?;
-    let provider = Arc::new(provider);
 
     info!("Connected successfully. Loading Aerodrome V2 pools from router...");
 
@@ -679,6 +793,21 @@ async fn main() -> Result<(), eyre::Report> {
                 if reserve0.is_zero() || reserve1.is_zero() {
                     warn!("Aerodrome V2 {} skipped: empty reserves at {:?}", spec.label, pool_result.pool);
                     continue;
+                }
+
+                // Warm decimals for newly discovered tokens
+                for token in [token0, token1] {
+                    if !registry.decimals_cache.contains_key(&token) {
+                        let token_contract = IERC20::new(token, provider.as_ref());
+                        match token_contract.decimals().call().await {
+                            Ok(result) => {
+                                registry.decimals_cache.insert(token, result.decimals as u32);
+                            }
+                            Err(_) => {
+                                registry.decimals_cache.insert(token, 18);
+                            }
+                        }
+                    }
                 }
 
                 registry.register_pool_with_state(
@@ -787,6 +916,11 @@ async fn main() -> Result<(), eyre::Report> {
                     continue;
                 };
 
+                // Use cached dynamic gas price (updated in background task)
+                let gas_cost_usd = (gas_price_wei.load(Ordering::Relaxed) as f64
+                    * config.execution_gas_limit as f64 / 1e18)
+                    * *weth_price_usd.read().await;
+
                 for opp in opportunities {
                     stats.opportunities_found.fetch_add(1, Ordering::Relaxed);
 
@@ -796,30 +930,29 @@ async fn main() -> Result<(), eyre::Report> {
 
                     let dec_in = registry.decimals_cache.get(&opp.token_in).cloned().unwrap_or(18);
 
+                    let weth_price = *weth_price_usd.read().await;
+
                     // Perform local EVM simulation and Dynamic Binary Search optimization
                     let sim_start = Instant::now();
                     let (opt_size, opt_profit_usd) = optimize_loan_size(
-                        pool_a, pool_b, opp.token_in, opp.token_out, dec_in, weth_price_usd
+                        pool_a, pool_b, opp.token_in, opp.token_out, dec_in, weth_price
                     );
                     let sim_time_ms = sim_start.elapsed().as_secs_f64() * 1000.0;
 
-                    if opt_profit_usd >= MIN_PROFIT_USD {
+                    if opt_profit_usd >= config.min_profit_usd {
                         stats.profitable_after_fees.fetch_add(1, Ordering::Relaxed);
                         stats.total_estimated_profit_cents.fetch_add((opt_profit_usd * 100.0) as u64, Ordering::Relaxed);
 
-                        // Print beautiful log format requested
-                        println!("\n[🎯 DRY RUN OPPORTUNITY DETECTED]");
-                        println!("- Path: {:?} -> {:?} -> {:?}", opp.token_in, opp.token_out, opp.token_in);
-                        
-                        let size_usd = amount_to_usd(opt_size, opp.token_in, dec_in, weth_price_usd).unwrap_or(0.0);
+                        let size_usd = amount_to_usd(opt_size, opp.token_in, dec_in, weth_price).unwrap_or(0.0);
 
                         let aave_fee_usd = size_usd * 0.0005;
-                        let gas_cost_usd = 0.003;
                         let net_profit_usd = opt_profit_usd - aave_fee_usd - gas_cost_usd;
 
+                        println!("\n[🎯 DRY RUN OPPORTUNITY DETECTED]");
+                        println!("- Path: {:?} -> {:?} -> {:?}", opp.token_in, opp.token_out, opp.token_in);
                         println!("- Optimal Flash Loan Size: ${:.2}", size_usd);
                         println!("- Aave V3 Fee (0.05%): ${:.4}", aave_fee_usd);
-                        println!("- Estimated Gas Cost: ${:.4} (Base L2 ~ $0.003)", gas_cost_usd);
+                        println!("- Estimated Gas Cost: ${:.4} (Base L2 dynamic)", gas_cost_usd);
                         println!("- Projected Gross Profit: ${:.2}", opt_profit_usd);
                         println!("- Projected NET PROFIT to Wallet: ${:.2}", net_profit_usd);
                         println!("- Latency (Simulation Time): {:.4} ms\n", sim_time_ms);
