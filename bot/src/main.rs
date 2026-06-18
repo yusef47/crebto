@@ -4,13 +4,11 @@
 //        $5k–$30k liquidity range, skips major pairs, 4+3 safety layers.
 
 use alloy::{
-    network::Ethereum,
     primitives::{address, Address, B256, U256},
     providers::{Provider, ProviderBuilder, WsConnect},
     pubsub::PubSubFrontend,
     rpc::types::eth::Filter,
     sol,
-    transports::http::Http,
 };
 use reqwest::Url;
 use futures_util::StreamExt;
@@ -915,6 +913,9 @@ async fn main() -> Result<(), eyre::Report> {
 
     let mut safe_discovered = Vec::new();
     for pool in &discovered {
+        // BACKUP POOL BYPASS: hardcoded WSEI/USDC pool is trusted, skip safety
+        let is_backup_pool = pool.address == address!("0xa97b36c4ddd400e9726f2d960cf4e8aac4746194");
+
         // Fetch decimals for both tokens if not already cached
         for token in [pool.token0, pool.token1] {
             if !registry.decimals_cache.contains_key(&token) {
@@ -932,6 +933,27 @@ async fn main() -> Result<(), eyre::Report> {
 
         let dec0 = registry.decimals_cache.get(&pool.token0).copied().unwrap_or(18);
         let dec1 = registry.decimals_cache.get(&pool.token1).copied().unwrap_or(18);
+
+        if is_backup_pool {
+            // Force-register backup pool without safety checks (RPC may lag on boot)
+            safe_discovered.push(pool.clone());
+            registry.register_pool_with_state(
+                pool.address,
+                pool.token0,
+                pool.token1,
+                pool.fee_bps,
+                "uniswap_v2",
+                pool.reserve0,
+                pool.reserve1,
+                pool.stable,
+            );
+            info!(
+                "✅ Backup pool force-registered: {} at {:?} (token0={:?}, token1={:?})",
+                pool.label, pool.address, pool.token0, pool.token1
+            );
+            safe_pools += 1;
+            continue;
+        }
 
         // Run v0.7 safety checks on both tokens (includes ownership, liquidity lock, whale filter)
         let (safety0, safety1) = safety_checker.check_pair_v07(

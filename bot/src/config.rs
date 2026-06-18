@@ -61,7 +61,7 @@ impl Config {
             .or_else(|_| env::var("ALCHEMY_HTTP"))
             .unwrap_or_else(|_| {
                 if ws_rpc_url.contains("sei-apis") {
-                    "https://evm-rpc.sei-apis.com".to_string()
+                    "https://sei-evm-rpc.publicnode.com".to_string()
                 } else {
                     ws_rpc_url.replace("wss://", "https://").replace("/ws/", "/")
                 }
