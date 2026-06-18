@@ -120,7 +120,7 @@ impl FactoryScanner {
                 }
             };
 
-            if total_pairs == 1 {
+            if total_pairs == 0 {
                 continue;
             }
 
