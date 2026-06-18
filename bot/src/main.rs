@@ -837,7 +837,7 @@ async fn main() -> Result<(), eyre::Report> {
     info!("DRY RUN MODE: {}", config.dry_run);
     info!("Connecting to configured WSS stream");
 
-    info!("Connected successfully. Discovering Aerodrome V2 pools dynamically...");
+    info!("Connected successfully. Discovering DragonSwap pools dynamically...");
 
     // Seed tokens for long-tail discovery (WSEI/USDC pairs + meme coins)
     let seed_tokens = vec![WSEI, USDC];
@@ -942,8 +942,8 @@ async fn main() -> Result<(), eyre::Report> {
     // where reserve ratio does NOT equal market price, so they give wildly wrong prices.
     for (addr, pool) in &registry.pools {
         if pool.dex_name == "uniswap_v2" && !pool.stable {
-            let pair = if pool.token0 < pool.token1 { (pool.token0, pool.token1) } else { (pool.token1, pool.token0) };
-            if pair == (WSEI, USDC) {
+            let tokens = [pool.token0, pool.token1];
+            if tokens.contains(&WSEI) && tokens.contains(&USDC) {
                 price_oracle_pool = Some(*addr);
                 break;
             }
@@ -958,7 +958,7 @@ async fn main() -> Result<(), eyre::Report> {
                 let r1 = reserves.reserve1.to::<u128>() as f64;
                 let price = (r1 / 1e6) / (r0 / 1e18);
                 if price > 0.0 && price.is_finite() {
-                    info!("🔗 ETH/USD price from V2 pool: ${:.2}", price);
+                    info!("🔗 WSEI/USD price from V2 pool: ${:.2}", price);
                     *weth_price_usd.write().await = price;
                 } else {
                     warn!("⚠️ V2 pool returned invalid price, using fallback 2500");
@@ -969,7 +969,7 @@ async fn main() -> Result<(), eyre::Report> {
             }
         }
     } else {
-        warn!("⚠️ No WSEI/USDC V2 pool found for price oracle, using fallback 2500");
+        warn!("⚠️ No WSEI/USDC V2 pool found for price oracle, using fallback ${:.2}", initial_wsei_price);
     }
 
     // Spawn periodic WSEI price update task from the same V2 pool
@@ -1024,7 +1024,7 @@ async fn main() -> Result<(), eyre::Report> {
             let elapsed = start_time.elapsed().as_secs();
             let price = *price_for_report.read().await;
             stats_clone.print_report(elapsed);
-            info!("🔗 Current ETH/USD price: ${:.2}", price);
+            info!("🔗 Current WSEI/USD price: ${:.2}", price);
         }
     });
 

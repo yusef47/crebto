@@ -1,32 +1,13 @@
 use alloy::{
-    primitives::{Address, U256},
+    primitives::{Address, Bytes, U256},
     providers::Provider,
     pubsub::PubSubFrontend,
+    rpc::types::eth::TransactionRequest,
     sol,
 };
 use tracing::{info, warn};
 
-use crate::{config::Config, WSEI, USDC};
-
-sol! {
-    #[sol(rpc)]
-    interface IUniswapV2Factory {
-        function allPairsLength() external view returns (uint256 count);
-        function allPairs(uint256 index) external view returns (address pool);
-    }
-
-    #[sol(rpc)]
-    interface IV2Pool {
-        function token0() external view returns (address token);
-        function token1() external view returns (address token);
-        function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint32 blockTimestampLast);
-    }
-
-    #[sol(rpc)]
-    interface IERC20 {
-        function decimals() external view returns (uint8 dec);
-    }
-}
+use crate::{config::Config, WSEI, USDC};sol! {#[sol(rpc)]interface IV2Pool {function token0() external view returns (address token);function token1() external view returns (address token);function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint32 blockTimestampLast);}#[sol(rpc)]interface IERC20 {function decimals() external view returns (uint8 dec);}}
 
 /// Discovered pool candidate with metadata for safety evaluation.
 #[derive(Debug, Clone)]
@@ -102,12 +83,20 @@ impl FactoryScanner {
         let mut discovered = Vec::new();
 
         for factory_meta in &self.factories {
-            let factory = IUniswapV2Factory::new(factory_meta.address, provider);
-
-            let total_pairs = match factory.allPairsLength().call().await {
-                Ok(result) => result.count.to::<u64>() as usize,
+            // Raw eth_call for allPairsLength — bypass alloy sol! decoding issues
+            let tx_len = TransactionRequest::default()
+                .to(factory_meta.address)
+                .input(Bytes::from_static(&[0x57, 0x4f, 0x2b, 0xa3]).into());
+            let total_pairs = match provider.call(&tx_len).await {
+                Ok(bytes) => {
+                    if bytes.len() < 32 {
+                        warn!("Factory {} returned {} bytes for allPairsLength, expected 32", factory_meta.dex_name, bytes.len());
+                        continue;
+                    }
+                    U256::from_be_slice(&bytes).to::<u64>() as usize
+                }
                 Err(e) => {
-                    warn!("Failed to get allPairsLength for {} factory: {}", factory_meta.dex_name, e);
+                    warn!("Failed to get allPairsLength for {} factory (raw call): {}", factory_meta.dex_name, e);
                     continue;
                 }
             };
@@ -123,8 +112,18 @@ impl FactoryScanner {
             );
 
             for i in start..total_pairs {
-                let pool_addr = match factory.allPairs(U256::from(i)).call().await {
-                    Ok(result) => result.pool,
+                let mut call_data = vec![0x1e, 0x3d, 0xd1, 0x8b];
+                call_data.extend_from_slice(&U256::from(i).to_be_bytes_vec());
+                let tx_pair = TransactionRequest::default()
+                    .to(factory_meta.address)
+                    .input(Bytes::from(call_data).into());
+                let pool_addr = match provider.call(&tx_pair).await {
+                    Ok(bytes) => {
+                        if bytes.len() < 32 {
+                            continue;
+                        }
+                        Address::from_slice(&bytes[12..32])
+                    }
                     Err(_) => continue,
                 };
 
