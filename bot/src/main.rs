@@ -1,7 +1,7 @@
 // Production-ready, high-performance, and self-contained Crebto Arbitrage Bot
-// Built for Base Layer-2 Network (2026)
-// v0.6: Dynamic Shadow Sniper — auto-discovers long-tail/meme pools
-//        with honeypot/tax safety filters and live trading config.
+// Built for Sei EVM Mainnet (Chain ID: 1329)
+// v0.7: Quiet Wolf — long-tail factory scanner with absolute safety filters
+//        $5k–$30k liquidity range, skips major pairs, 4+3 safety layers.
 
 use alloy::{
     primitives::{address, Address, B256, U256},
@@ -22,9 +22,10 @@ use tokio::sync::RwLock;
 mod config;
 use config::Config;
 
-mod discovery;
+mod scanner;
+mod multicall;
 mod safety;
-use discovery::PoolDiscovery;
+use scanner::FactoryScanner;
 use safety::{TokenSafetyChecker, TokenSafety};
 
 // --- GLOBAL SETTINGS ---
@@ -34,12 +35,12 @@ use safety::{TokenSafetyChecker, TokenSafety};
 // const GAS_LIMIT: u64 = 600_000;
 // const BASE_FEE_WEI: u64 = 5_000_000; // ~0.005 gwei typical Base gas
 
-pub const CHAINLINK_ETH_USD: Address = address!("71041dddad356df2e01399310d6b3f67c3071b60");
+// Sei EVM Chain ID = 1329 — loaded from Config at runtime.
 
 // --- VERIFIED EVENT SIGNATURES (KECCAK-256) ---
 pub const UNISWAP_V3_SWAP_TOPIC: B256 = alloy::primitives::b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
-pub const AERODROME_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("b3e2773606abfd36b5bd91394b3a54d1398336c65005baf7bf7a05efeffaf75b");
-pub const AERODROME_V2_SYNC_TOPIC: B256 = alloy::primitives::b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
+pub const UNISWAP_V2_SWAP_TOPIC: B256 = alloy::primitives::b256!("d78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822");
+pub const UNISWAP_V2_SYNC_TOPIC: B256 = alloy::primitives::b256!("1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
 
 pub const UNISWAP_V3_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118");
 pub const AERODROME_POOL_CREATED_TOPIC: B256 = alloy::primitives::b256!("2128d88d14c80cb081c1252a5acff7a264671bf199ce226b53788fb26065005e");
@@ -50,15 +51,12 @@ pub const AERODROME_V2_FACTORY: Address = address!("420DD381b31aEf6683db6B902084
 pub const AERODROME_V2_ROUTER: Address = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
 pub const AERODROME_SLIPSTREAM_FACTORY: Address = address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A");
 pub const ZERO_ADDRESS: Address = address!("0000000000000000000000000000000000000000");
+pub const DRAGONSWAP_FACTORY: Address = address!("0x71f6b49ae1558357bbb5a6074f1143c46cbca03d");
+pub const DRAGONSWAP_ROUTER: Address = address!("0xa4cF2F53D1195aDDdE9e4D3aCa54f556895712f2");
 
 // --- TARGET ASSETS ADDRESSES & DECIMALS ---
-pub const WETH: Address = address!("4200000000000000000000000000000000000006");
-pub const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
-pub const AERO: Address = address!("940181a94A35A4569E4529A3CDfB74e38FD98631");
-pub const BRETT: Address = address!("532f27101965dd16442e59d40670faf5ebb142e4");
-pub const DEGEN: Address = address!("4ed4E862860beD51a9570b96d89aF5E1B0Efefed");
-pub const TOSHI: Address = address!("8544fe9d190fd7ec52860abbf45088e81ee24a8c");
-pub const MIGGLES: Address = address!("B1a03EdA10342529bBF8EB700a06C60441fEf25d");
+pub const WSEI: Address = address!("E30feDd158A2e3b13e9badaeABaFc5516e95e8C7");
+pub const USDC: Address = address!("e15fC38F6D8c56aF07bbCBe3BAf5708A2Bf42392");
 
 sol! {
     #[sol(rpc)]
@@ -70,11 +68,6 @@ sol! {
     #[sol(rpc)]
     interface IChainlinkPriceFeed {
         function latestAnswer() external view returns (int256 answer);
-    }
-
-    #[sol(rpc)]
-    interface IAerodromeRouter {
-        function poolFor(address tokenA, address tokenB, bool stable, address factory) external view returns (address pool);
     }
 
     #[sol(rpc)]
@@ -95,7 +88,7 @@ pub struct TrackedPool {
     pub tick: i32,
     pub fee_bps: u32,
     pub tick_spacing: Option<i32>,
-    pub dex_name: String, // "uniswap_v3" or "aerodrome_cl" or "aerodrome_v2"
+    pub dex_name: String, // "uniswap_v3" or "aerodrome_cl" or "uniswap_v2"
     pub last_update_block: u64,
     // V2 AMM reserve tracking
     pub reserve0: U256,
@@ -115,13 +108,41 @@ pub struct ArbOpportunity {
     pub spread_bps: f64,
 }
 
+/// Sliding-window trade rate limiter to protect the –0 SEI gas tank.
+struct TradeLimiter {
+    max_per_hour: u32,
+    history: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl TradeLimiter {
+    fn new(max_per_hour: u32) -> Self {
+        Self { max_per_hour, history: std::collections::VecDeque::new() }
+    }
+    fn allow(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        while let Some(front) = self.history.front() {
+            if now.duration_since(*front).as_secs() > 3600 {
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.history.len() >= self.max_per_hour as usize {
+            false
+        } else {
+            self.history.push_back(now);
+            true
+        }
+    }
+}
+
 pub struct BotStats {
     pub swaps_detected: AtomicU64,
     pub opportunities_found: AtomicU64,
     pub profitable_after_fees: AtomicU64,
     pub uniswap_swaps: AtomicU64,
     pub aerodrome_cl_swaps: AtomicU64,
-    pub aerodrome_v2_swaps: AtomicU64,
+    pub uniswap_v2_swaps: AtomicU64,
     pub blocks_seen: AtomicU64,
     pub consecutive_failures: AtomicU32,
     pub tracked_pools_active: AtomicU32,
@@ -136,7 +157,7 @@ impl BotStats {
             profitable_after_fees: AtomicU64::new(0),
             uniswap_swaps: AtomicU64::new(0),
             aerodrome_cl_swaps: AtomicU64::new(0),
-            aerodrome_v2_swaps: AtomicU64::new(0),
+            uniswap_v2_swaps: AtomicU64::new(0),
             blocks_seen: AtomicU64::new(0),
             consecutive_failures: AtomicU32::new(0),
             tracked_pools_active: AtomicU32::new(0),
@@ -150,7 +171,7 @@ impl BotStats {
         let profitable = self.profitable_after_fees.load(Ordering::Relaxed);
         let uni = self.uniswap_swaps.load(Ordering::Relaxed);
         let aero_cl = self.aerodrome_cl_swaps.load(Ordering::Relaxed);
-        let aero_v2 = self.aerodrome_v2_swaps.load(Ordering::Relaxed);
+        let uni_v2 = self.uniswap_v2_swaps.load(Ordering::Relaxed);
         let blocks = self.blocks_seen.load(Ordering::Relaxed);
         let tracked = self.tracked_pools_active.load(Ordering::Relaxed);
         let profit_cents = self.total_estimated_profit_cents.load(Ordering::Relaxed);
@@ -164,12 +185,72 @@ impl BotStats {
         info!("║ 🔄 Total swaps detected: {}                      ", swaps);
         info!("║    ├─ Uniswap V3: {}                             ", uni);
         info!("║    ├─ Aerodrome CL: {}                           ", aero_cl);
-        info!("║    └─ Aerodrome V2: {}                           ", aero_v2);
+        info!("║    └─ Aerodrome V2: {}                           ", uni_v2);
         info!("║ 📋 Active tracked pools: {}                      ", tracked);
         info!("║ 🎯 Arbitrage opportunities: {}                   ", opps);
         info!("║ 💰 Profitable (after fees): {}                   ", profitable);
         info!("║ 💵 Est. total profit: ${:.2}                     ", profit_usd);
         info!("╚══════════════════════════════════════════════════╝");
+    }
+}
+
+
+/// Cold-boot reserve sync via Multicall3.
+/// Batches getReserves() calls for all safe pools and updates existing registry entries.
+/// Only updates already-registered pools to avoid double-registration.
+async fn cold_boot_pool_states<P: Provider<PubSubFrontend>>(
+    provider: &P,
+    registry: &mut PoolRegistry,
+    pools: &[scanner::DiscoveredPool],
+    multicall3_addr: Option<Address>,
+) {
+    let Some(mc_addr) = multicall3_addr else {
+        info!("Multicall3 not configured; skipping cold-boot batch sync.");
+        return;
+    };
+
+    use crate::multicall::multicall3_aggregate3;
+    use alloy::sol_types::SolCall;
+
+
+
+    let start = std::time::Instant::now();
+    let calls: Vec<(Address, alloy::primitives::Bytes)> = pools
+        .iter()
+        .map(|pool| {
+            let call = IAerodromeV2Pool::getReservesCall {};
+            (pool.address, alloy::primitives::Bytes::from(call.abi_encode()))
+        })
+        .collect();
+
+    match multicall3_aggregate3(provider, mc_addr, calls).await {
+        Ok(results) => {
+            for (pool, &(success, ref data)) in pools.iter().zip(results.iter()) {
+                if success && data.len() >= 64 {
+                    if let Some(entry) = registry.pools.get_mut(&pool.address) {
+                        let reserve0 = U256::from_be_slice(&data[0..32]);
+                        let reserve1 = U256::from_be_slice(&data[32..64]);
+                        entry.reserve0 = reserve0;
+                        entry.reserve1 = reserve1;
+                        entry.sqrt_price_x96 = sqrt_price_x96_from_reserves(reserve0, reserve1);
+                    }
+                }
+            }
+            info!("Cold-boot synced {} pools in {:.2}s via Multicall3", pools.len(), start.elapsed().as_secs_f64());
+        }
+        Err(e) => {
+            warn!("Cold-boot Multicall3 failed: {}. Falling back to sequential init.", e);
+            for pool in pools {
+                let v2_pool = IAerodromeV2Pool::new(pool.address, provider);
+                if let Ok(reserves) = v2_pool.getReserves().call().await {
+                    if let Some(entry) = registry.pools.get_mut(&pool.address) {
+                        entry.reserve0 = reserves.reserve0;
+                        entry.reserve1 = reserves.reserve1;
+                        entry.sqrt_price_x96 = sqrt_price_x96_from_reserves(reserves.reserve0, reserves.reserve1);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -229,7 +310,7 @@ fn simulate_uniswap_v3_swap(
     }
 }
 
-fn simulate_aerodrome_v2_swap(
+fn simulate_uniswap_v2_swap(
     amount_in: U256,
     reserve_in: U256,
     reserve_out: U256,
@@ -262,9 +343,9 @@ fn quote_first_tokens(token0: Address, token1: Address) -> (Address, Address) {
     if token0 == USDC || token1 == USDC {
         let other = if token0 == USDC { token1 } else { token0 };
         (USDC, other)
-    } else if token0 == WETH || token1 == WETH {
-        let other = if token0 == WETH { token1 } else { token0 };
-        (WETH, other)
+    } else if token0 == WSEI || token1 == WSEI {
+        let other = if token0 == WSEI { token1 } else { token0 };
+        (WSEI, other)
     } else {
         (token0, token1)
     }
@@ -274,7 +355,7 @@ fn amount_to_usd(amount: U256, token: Address, _decimals: u32, eth_price_usd: f6
     let raw = amount.to::<u128>() as f64;
     if token == USDC {
         Some(raw / 1e6)
-    } else if token == WETH {
+    } else if token == WSEI {
         Some((raw / 1e18) * eth_price_usd)
     } else {
         None
@@ -285,7 +366,7 @@ fn amount_to_usd(amount: U256, token: Address, _decimals: u32, eth_price_usd: f6
 fn usd_to_amount(usd_val: f64, token: Address, decimals: u32, eth_price_usd: f64) -> Option<U256> {
     let raw_val = if token == USDC {
         usd_val * 1e6
-    } else if token == WETH {
+    } else if token == WSEI {
         (usd_val / eth_price_usd) * 1e18
     } else {
         let decimals_factor = 10_u128.checked_pow(decimals)?;
@@ -299,7 +380,7 @@ fn usd_to_amount(usd_val: f64, token: Address, decimals: u32, eth_price_usd: f64
 fn usd_conversion_factor(token: Address, decimals: u32, eth_price_usd: f64) -> f64 {
     let factor = if token == USDC {
         1e6
-    } else if token == WETH {
+    } else if token == WSEI {
         1e18 / eth_price_usd
     } else {
         10_u128.pow(decimals) as f64
@@ -310,9 +391,10 @@ fn usd_conversion_factor(token: Address, decimals: u32, eth_price_usd: f64) -> f
 
 /// Check if a token pair includes a volatile meme coin.
 /// Meme coins have higher profit sanity caps (20% vs 5%) to allow catching flash crashes.
-fn is_meme_coin_pair(token0: Address, token1: Address) -> bool {
-    let meme_coins = [BRETT, DEGEN, TOSHI, MIGGLES];
-    meme_coins.contains(&token0) || meme_coins.contains(&token1)
+fn is_meme_coin_pair(_token0: Address, _token1: Address) -> bool {
+    // Sei long-tail meme coins can be added here once known
+    let _meme_coins: [Address; 0] = [];
+    false
 }
 
 /// Calculate price impact for a swap input on a given pool.
@@ -322,7 +404,7 @@ fn is_meme_coin_pair(token0: Address, token1: Address) -> bool {
 ///   ticks with decreasing liquidity. The actual impact is typically 2–5× higher
 ///   than the simple amount/liquidity ratio. We apply a 3× safety multiplier.
 fn calculate_price_impact(pool: &TrackedPool, amount_in: U256, token_in: Address) -> f64 {
-    if pool.dex_name == "aerodrome_v2" {
+    if pool.dex_name == "uniswap_v2" {
         let reserve_in = if pool.token0 == token_in {
             pool.reserve0
         } else {
@@ -360,7 +442,7 @@ fn optimize_loan_size(
 ) -> (U256, f64) {
     let start_time = Instant::now();
 
-    if token_in != USDC && token_in != WETH {
+    if token_in != USDC && token_in != WSEI {
         return (U256::ZERO, 0.0);
     }
 
@@ -405,13 +487,13 @@ fn optimize_loan_size(
 
         // 1. Simulate swap on Pool A
         let zero_for_one_a = pool_a.token0 == token_in;
-        let amount_out_a = if pool_a.dex_name == "aerodrome_v2" {
+        let amount_out_a = if pool_a.dex_name == "uniswap_v2" {
             let (reserve_in, reserve_out) = if zero_for_one_a {
                 (pool_a.reserve0, pool_a.reserve1)
             } else {
                 (pool_a.reserve1, pool_a.reserve0)
             };
-            simulate_aerodrome_v2_swap(size, reserve_in, reserve_out, pool_a.fee_bps)
+            simulate_uniswap_v2_swap(size, reserve_in, reserve_out, pool_a.fee_bps)
         } else {
             simulate_uniswap_v3_swap(size, zero_for_one_a, pool_a.sqrt_price_x96, pool_a.liquidity, pool_a.fee_bps)
         };
@@ -431,13 +513,13 @@ fn optimize_loan_size(
 
         // 3. Simulate swap on Pool B
         let zero_for_one_b = pool_b.token0 == token_out;
-        let amount_out_b = if pool_b.dex_name == "aerodrome_v2" {
+        let amount_out_b = if pool_b.dex_name == "uniswap_v2" {
             let (reserve_in, reserve_out) = if zero_for_one_b {
                 (pool_b.reserve0, pool_b.reserve1)
             } else {
                 (pool_b.reserve1, pool_b.reserve0)
             };
-            simulate_aerodrome_v2_swap(amount_out_a, reserve_in, reserve_out, pool_b.fee_bps)
+            simulate_uniswap_v2_swap(amount_out_a, reserve_in, reserve_out, pool_b.fee_bps)
         } else {
             simulate_uniswap_v3_swap(amount_out_a, zero_for_one_b, pool_b.sqrt_price_x96, pool_b.liquidity, pool_b.fee_bps)
         };
@@ -515,37 +597,11 @@ impl PoolRegistry {
     }
 
     fn load_known_pools(&mut self) {
-        self.decimals_cache.insert(WETH, 18);
+        // v0.7: All hardcoded Base pool addresses removed.
+        // Pools are discovered dynamically via FactoryScanner on Sei EVM.
+        self.decimals_cache.insert(WSEI, 18);
         self.decimals_cache.insert(USDC, 6);
-        self.decimals_cache.insert(AERO, 18);
-        self.decimals_cache.insert(BRETT, 18);
-        self.decimals_cache.insert(DEGEN, 18);
-        self.decimals_cache.insert(TOSHI, 18);
-        self.decimals_cache.insert(MIGGLES, 18);
-
-        // === WETH/USDC pools ===
-        self.register_pool(address!("d0b53d9277642d899df5c87a3966a349a798f224"), WETH, USDC, 500, "uniswap_v3");
-        self.register_pool(address!("b4cb800910b228ed3d0834cf79d697127bbb00e5"), WETH, USDC, 3000, "uniswap_v3");
-        self.register_pool(address!("b2cc224c1c9fee385f8ad6a55b4d94e92359dc59"), WETH, USDC, 100, "aerodrome_cl");
-        self.register_pool(address!("dbc6998296caa1652a810dc8d3baf4a8294330f1"), WETH, USDC, 500, "aerodrome_cl");
-
-        // === BRETT/WETH pools ===
-        self.register_pool(address!("4e829f8a5213c42535ab84aa40bd4adcce9cba02"), BRETT, WETH, 10000, "aerodrome_cl");   // Slipstream 1%
-        self.register_pool(address!("ba3f945812a83471d709bce9c3ca699a19fb46f7"), BRETT, WETH, 10000, "uniswap_v3");      // Uni V3 1%
-        self.register_pool(address!("76bf0abd20f1e0155ce40a62615a90a709a6c3d8"), BRETT, WETH, 3000, "uniswap_v3");       // Uni V3 0.3%
-
-        // === DEGEN/WETH pools ===
-        self.register_pool(address!("c9034c3e7f58003e6ae0c8438e7c8f4598d5acaa"), DEGEN, WETH, 3000, "uniswap_v3");      // Uni V3 0.3%  $1.4M liquidity
-        self.register_pool(address!("afb62448929664bfccb0aae22f232520e765ba88"), DEGEN, WETH, 3000, "aerodrome_cl");     // Aero Slipstream $18k
-
-        // === AERO/USDC pools (from previous research) ===
-        self.register_pool(address!("6cDAcb3025D68e11c3e24383B69B18B3cc2F43D8"), AERO, USDC, 200, "aerodrome_cl");      // Aero Slipstream
-        self.register_pool(address!("9809e877192B0B18E1CC0a3F5110093D29B8C84A"), AERO, WETH, 3000, "aerodrome_cl");      // Aero Slipstream
-
-        info!("📋 Pool Registry loaded: {} known pools across {} pairs",
-            self.pools.len(),
-            self.pair_to_pools.len()
-        );
+        info!("Pool Registry initialized (empty) - awaiting scanner discovery");
     }
 
     async fn warm_decimals<P: Provider<PubSubFrontend>>(&mut self, provider: &P) {
@@ -599,7 +655,7 @@ impl PoolRegistry {
             entry.push(address);
         }
 
-        let sqrt_price_x96 = if dex == "aerodrome_v2" {
+        let sqrt_price_x96 = if dex == "uniswap_v2" {
             sqrt_price_x96_from_reserves(reserve0, reserve1)
         } else {
             U256::ZERO
@@ -757,13 +813,13 @@ async fn main() -> Result<(), eyre::Report> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("╔══════════════════════════════════════════════╗");
-    info!("║    🚀 Starting Crebto Arbitrage Bot v0.6    ║");
-    info!("║    🕵️‍♂️ Shadow Sniper Mode: Long-Tail/Meme   ║");
+    info!("║    🚀 Starting Crebto Arbitrage Bot v0.7    ║");
+    info!("║    🐺 Quiet Wolf — Sei EVM Long-Tail       ║");
     info!("╚══════════════════════════════════════════════╝");
 
     // Load configuration from environment
     let config = Config::load_from_env()?;
-    let wss_url = config.alchemy_wss.clone();
+    let wss_url = config.ws_rpc_url.clone();
 
     let mut registry = PoolRegistry::new();
     let stats = Arc::new(BotStats::new());
@@ -783,28 +839,32 @@ async fn main() -> Result<(), eyre::Report> {
 
     info!("Connected successfully. Discovering Aerodrome V2 pools dynamically...");
 
-    // Seed tokens for long-tail discovery (WETH/USDC pairs + meme coins)
-    let seed_tokens = vec![WETH, USDC, AERO, BRETT, DEGEN, TOSHI, MIGGLES];
+    // Seed tokens for long-tail discovery (WSEI/USDC pairs + meme coins)
+    let seed_tokens = vec![WSEI, USDC];
 
-    // Initial WETH price for liquidity estimation (will be refined later)
-    let initial_weth_price = 1719.0;
+    // Initial WSEI price for liquidity estimation (will be refined later)
+    let initial_wsei_price = 0.05;
 
     // Discover all V2 pools with sufficient liquidity
-    let discovered = PoolDiscovery::discover_long_tail_pairs(
+    let scanner = FactoryScanner::from_config(&config);
+    let discovered = scanner.discover_long_tail_pairs(
         provider.as_ref(),
         &seed_tokens,
-        initial_weth_price,
-        config.min_liquidity_usd,
+        initial_wsei_price,
     ).await;
 
     info!("🔍 Discovered {} pools with >${:.2} liquidity", discovered.len(), config.min_liquidity_usd);
 
     // Initialize safety checker
-    let safety_checker = TokenSafetyChecker::new(config.max_tax_bps, config.min_liquidity_usd);
+    // v0.7: Use DragonSwap router/factory as Sei EVM fallback.
+    // Override via AERODROME_ROUTER / AERODROME_FACTORY env vars if needed.
+    let router = config.aerodrome_router.unwrap_or(DRAGONSWAP_ROUTER);
+    let safety_checker = TokenSafetyChecker::new(router, config.max_tax_bps, config.min_liquidity_usd, config.liquidity_locker);
     let mut safe_pools = 0;
     let mut rejected_pools = 0;
 
-    for pool in discovered {
+    let mut safe_discovered = Vec::new();
+    for pool in &discovered {
         // Fetch decimals for both tokens if not already cached
         for token in [pool.token0, pool.token1] {
             if !registry.decimals_cache.contains_key(&token) {
@@ -823,16 +883,18 @@ async fn main() -> Result<(), eyre::Report> {
         let dec0 = registry.decimals_cache.get(&pool.token0).copied().unwrap_or(18);
         let dec1 = registry.decimals_cache.get(&pool.token1).copied().unwrap_or(18);
 
-        // Run safety checks on both tokens
-        let (safety0, safety1) = safety_checker.check_pair(
+        // Run v0.7 safety checks on both tokens (includes ownership, liquidity lock, whale filter)
+        let (safety0, safety1) = safety_checker.check_pair_v07(
             provider.as_ref(),
             pool.token0,
             pool.token1,
+            pool.address,
             dec0,
             dec1,
             pool.reserve0,
             pool.reserve1,
-            initial_weth_price,
+            initial_wsei_price,
+            config.multicall3,
         ).await;
 
         if safety0 != TokenSafety::Safe || safety1 != TokenSafety::Safe {
@@ -845,12 +907,13 @@ async fn main() -> Result<(), eyre::Report> {
         }
 
         // Register the safe pool
+        safe_discovered.push(pool.clone());
         registry.register_pool_with_state(
             pool.address,
             pool.token0,
             pool.token1,
             pool.fee_bps,
-            "aerodrome_v2",
+            "uniswap_v2",
             pool.reserve0,
             pool.reserve1,
             pool.stable,
@@ -867,17 +930,20 @@ async fn main() -> Result<(), eyre::Report> {
         safe_pools, rejected_pools
     );
 
-    // Fetch initial WETH price from a WETH/USDC V2 volatile pool (more reliable than Chainlink on Base)
-    let weth_price_usd = Arc::new(RwLock::new(2500.0));
+    // v0.7: Cold-boot reserve sync via Multicall3 for all safe pools (under 5 seconds)
+    cold_boot_pool_states(provider.as_ref(), &mut registry, &safe_discovered, config.multicall3).await;
+
+    // Fetch initial WSEI price from a WSEI/USDC V2 volatile pool (more reliable than Chainlink on Base)
+    let weth_price_usd = Arc::new(RwLock::new(0.05));
     let mut price_oracle_pool: Option<Address> = None;
 
-    // Look for the WETH/USDC V2 volatile pool we just loaded to use as price oracle.
+    // Look for the WSEI/USDC V2 volatile pool we just loaded to use as price oracle.
     // Only use volatile pools (stable==false) — stable pools use a curve-based AMM
     // where reserve ratio does NOT equal market price, so they give wildly wrong prices.
     for (addr, pool) in &registry.pools {
-        if pool.dex_name == "aerodrome_v2" && !pool.stable {
+        if pool.dex_name == "uniswap_v2" && !pool.stable {
             let pair = if pool.token0 < pool.token1 { (pool.token0, pool.token1) } else { (pool.token1, pool.token0) };
-            if pair == (WETH, USDC) {
+            if pair == (WSEI, USDC) {
                 price_oracle_pool = Some(*addr);
                 break;
             }
@@ -903,10 +969,10 @@ async fn main() -> Result<(), eyre::Report> {
             }
         }
     } else {
-        warn!("⚠️ No WETH/USDC V2 pool found for price oracle, using fallback 2500");
+        warn!("⚠️ No WSEI/USDC V2 pool found for price oracle, using fallback 2500");
     }
 
-    // Spawn periodic WETH price update task from the same V2 pool
+    // Spawn periodic WSEI price update task from the same V2 pool
     let price_clone = weth_price_usd.clone();
     let provider_clone = provider.clone();
     let oracle_clone = price_oracle_pool;
@@ -968,8 +1034,8 @@ async fn main() -> Result<(), eyre::Report> {
         .address(registry.pools.keys().cloned().collect::<Vec<_>>())
         .event_signature(vec![
             UNISWAP_V3_SWAP_TOPIC,
-            AERODROME_V2_SWAP_TOPIC,
-            AERODROME_V2_SYNC_TOPIC,
+            UNISWAP_V2_SWAP_TOPIC,
+            UNISWAP_V2_SYNC_TOPIC,
         ]);
 
     let mut sub_logs = provider.subscribe_logs(&filter).await?.into_stream();
@@ -978,6 +1044,7 @@ async fn main() -> Result<(), eyre::Report> {
     stats.tracked_pools_active.store(registry.pools.len() as u32, Ordering::Relaxed);
 
     let mut current_block = 0u64;
+    let mut trade_limiter = TradeLimiter::new(config.max_trades_per_hour);
 
     loop {
         tokio::select! {
@@ -1019,12 +1086,12 @@ async fn main() -> Result<(), eyre::Report> {
                             opportunities = registry.update_from_swap(pool_address, sqrt_price, liquidity, 0, current_block);
                         }
                     }
-                } else if topic0 == AERODROME_V2_SWAP_TOPIC {
-                    // Aerodrome V2 Swap event:
+                } else if topic0 == UNISWAP_V2_SWAP_TOPIC {
+                    // Uniswap V2 Swap event:
                     // topics: [SwapTopic, sender, to]
                     // data: amount0In(32) | amount1In(32) | amount0Out(32) | amount1Out(32)
                     stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
-                    stats.aerodrome_v2_swaps.fetch_add(1, Ordering::Relaxed);
+                    stats.uniswap_v2_swaps.fetch_add(1, Ordering::Relaxed);
 
                     let log_data = log.data();
                     if log_data.data.len() >= 128 {
@@ -1035,8 +1102,8 @@ async fn main() -> Result<(), eyre::Report> {
 
                         opportunities = registry.update_from_v2_swap(pool_address, amount0_in, amount1_in, amount0_out, amount1_out, current_block);
                     }
-                } else if topic0 == AERODROME_V2_SYNC_TOPIC {
-                    // Aerodrome V2 Sync event:
+                } else if topic0 == UNISWAP_V2_SYNC_TOPIC {
+                    // Uniswap V2 Sync event:
                     // topics: [SyncTopic]
                     // data: reserve0(32) | reserve1(32)
                     // Sync is emitted on every swap, so it keeps reserves fresh even if we miss the Swap event.
@@ -1077,6 +1144,10 @@ async fn main() -> Result<(), eyre::Report> {
 
                     // opt_profit_usd is already net of flash loan fees, pool fees, and gas costs
                     if opt_profit_usd >= config.min_profit_usd {
+                        if !trade_limiter.allow() {
+                            warn!("Rate limit hit: {} trades/hour reached. Skipping opportunity.", config.max_trades_per_hour);
+                            continue;
+                        }
                         stats.profitable_after_fees.fetch_add(1, Ordering::Relaxed);
                         stats.total_estimated_profit_cents.fetch_add((opt_profit_usd * 100.0) as u64, Ordering::Relaxed);
 
@@ -1087,7 +1158,7 @@ async fn main() -> Result<(), eyre::Report> {
                         println!("- Path: {:?} -> {:?} -> {:?}", opp.token_in, opp.token_out, opp.token_in);
                         println!("- Optimal Flash Loan Size: ${:.2}", size_usd);
                         println!("- Aave V3 Fee (0.05%): ${:.4}", aave_fee_usd);
-                        println!("- Estimated Gas Cost: ${:.4} (Base L2 dynamic)", gas_cost_usd);
+                        println!("- Estimated Gas Cost: ${:.4} (Sei EVM dynamic)", gas_cost_usd);
                         println!("- Projected NET PROFIT to Wallet: ${:.2}", opt_profit_usd);
                         println!("- Latency (Simulation Time): {:.4} ms\n", sim_time_ms);
                     }

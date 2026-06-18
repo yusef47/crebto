@@ -4,8 +4,11 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub alchemy_wss: String,
-    pub alchemy_http: String,
+    /// WebSocket RPC endpoint (e.g. wss://evm-ws.sei-apis.com)
+    pub ws_rpc_url: String,
+    /// HTTP RPC endpoint (e.g. https://evm-rpc.sei-apis.com)
+    pub http_rpc_url: String,
+    pub chain_id: u64,
     pub dry_run: bool,
     pub private_key: Option<String>,
     pub executor_address: Option<Address>,
@@ -23,34 +26,44 @@ pub struct Config {
     pub aerodrome_router: Option<Address>,
     pub aerodrome_slipstream_router: Option<Address>,
     pub aerodrome_factory: Option<Address>,
+    pub saphyre_factory: Option<Address>,
+    pub dragonswap_factory: Option<Address>,
+    pub multicall3: Option<Address>,
     pub execution_gas_limit: u64,
     pub slippage_bps: u32,
     pub probe_sizes_usd: Vec<f64>,
-    // v0.6: Safety & live trading controls
+    // Safety & live trading controls
     pub min_liquidity_usd: f64,
+    pub max_liquidity_usd: f64,
     pub max_tax_bps: u32,
     pub max_daily_loss_usd: f64,
     pub max_trades_per_hour: u32,
+    pub liquidity_locker: Option<Address>,
 }
 
 impl Config {
     pub fn load_from_env() -> Result<Self, eyre::Report> {
-        // Load .env file if it exists (local dev)
         let _ = dotenvy::dotenv();
 
-        // DRY_RUN mode: if true, bot will only monitor and simulate, never send real TXs
         let dry_run = env::var("DRY_RUN")
             .unwrap_or_else(|_| "true".to_string())
             .parse::<bool>()
             .unwrap_or(true);
 
-        let alchemy_wss = env::var("ALCHEMY_WSS")
-            .map_err(|_| eyre::eyre!("ALCHEMY_WSS must be set in environment"))?;
+        // Backward-compat: accept ALCHEMY_WSS/ALCHEMY_HTTP, but prefer WS_RPC_URL / HTTP_RPC_URL
+        let ws_rpc_url = env::var("WS_RPC_URL")
+            .or_else(|_| env::var("ALCHEMY_WSS"))
+            .unwrap_or_else(|_| "wss://evm-ws.sei-apis.com".to_string());
 
-        let alchemy_http = env::var("ALCHEMY_HTTP")
-            .unwrap_or_else(|_| alchemy_wss.replace("wss://", "https://").replace("/ws/", "/"));
+        let http_rpc_url = env::var("HTTP_RPC_URL")
+            .or_else(|_| env::var("ALCHEMY_HTTP"))
+            .unwrap_or_else(|_| ws_rpc_url.replace("wss://", "https://").replace("/ws/", "/"));
 
-        // In DRY_RUN mode, private key and contract address are optional
+        let chain_id = env::var("CHAIN_ID")
+            .unwrap_or_else(|_| "1329".to_string())
+            .parse::<u64>()
+            .unwrap_or(1329);
+
         let private_key = env::var("PRIVATE_KEY").ok();
 
         let executor_address = env::var("EXECUTOR_ADDRESS")
@@ -116,6 +129,22 @@ impl Config {
             .ok()
             .and_then(|s| Address::from_str(&s).ok());
 
+        let saphyre_factory = env::var("SAPPHIRE_FACTORY")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
+        let dragonswap_factory = env::var("DRAGONSWAP_FACTORY")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
+        let multicall3 = env::var("MULTICALL3")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
+        let liquidity_locker = env::var("LIQUIDITY_LOCKER")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok());
+
         let execution_gas_limit = env::var("EXECUTION_GAS_LIMIT")
             .unwrap_or_else(|_| "600000".to_string())
             .parse::<u64>()
@@ -133,11 +162,15 @@ impl Config {
             .filter(|value| *value > 0.0)
             .collect::<Vec<_>>();
 
-        // v0.6 safety & live trading defaults
         let min_liquidity_usd = env::var("MIN_LIQUIDITY_USD")
             .unwrap_or_else(|_| "5000".to_string())
             .parse::<f64>()
             .unwrap_or(5000.0);
+
+        let max_liquidity_usd = env::var("MAX_LIQUIDITY_USD")
+            .unwrap_or_else(|_| "30000".to_string())
+            .parse::<f64>()
+            .unwrap_or(30_000.0);
 
         let max_tax_bps = env::var("MAX_TAX_BPS")
             .unwrap_or_else(|_| "500".to_string())
@@ -150,13 +183,14 @@ impl Config {
             .unwrap_or(10.0);
 
         let max_trades_per_hour = env::var("MAX_TRADES_PER_HOUR")
-            .unwrap_or_else(|_| "5".to_string())
+            .unwrap_or_else(|_| "15".to_string())
             .parse::<u32>()
-            .unwrap_or(5);
+            .unwrap_or(15);
 
         Ok(Self {
-            alchemy_wss,
-            alchemy_http,
+            ws_rpc_url,
+            http_rpc_url,
+            chain_id,
             dry_run,
             private_key,
             executor_address,
@@ -174,13 +208,18 @@ impl Config {
             aerodrome_router,
             aerodrome_slipstream_router,
             aerodrome_factory,
+            saphyre_factory,
+            dragonswap_factory,
+            multicall3,
             execution_gas_limit,
             slippage_bps,
             probe_sizes_usd,
             min_liquidity_usd,
+            max_liquidity_usd,
             max_tax_bps,
             max_daily_loss_usd,
             max_trades_per_hour,
+            liquidity_locker,
         })
     }
 }
