@@ -22,7 +22,16 @@ print("Cargo:", result.stdout.strip())
 print("Cloning repo...")
 os.chdir('/kaggle/working')
 subprocess.run(["rm", "-rf", "crebto"], check=False)
-subprocess.run(["git", "clone", "https://github.com/yusef47/crebto.git"], check=True)
+
+try:
+    gh_token = client.get_secret('GITHUB_TOKEN')
+    clone_url = f'https://{gh_token}@github.com/yusef47/crebto.git'
+    print('Cloning with token...')
+except Exception:
+    clone_url = 'https://github.com/yusef47/crebto.git'
+    print('Cloning without token...')
+
+subprocess.run(["git", "clone", clone_url], check=True)
 os.chdir('/kaggle/working/crebto/bot')
 
 # ── CELL 3: Read Kaggle Secrets and write .env ──
