@@ -1,13 +1,28 @@
 use alloy::{
+    network::Ethereum,
     primitives::{Address, Bytes, U256},
     providers::Provider,
-    pubsub::PubSubFrontend,
     rpc::types::eth::TransactionRequest,
     sol,
+    transports::Transport,
 };
 use tracing::{info, warn};
 
-use crate::{config::Config, WSEI, USDC};sol! {#[sol(rpc)]interface IV2Pool {function token0() external view returns (address token);function token1() external view returns (address token);function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint32 blockTimestampLast);}#[sol(rpc)]interface IERC20 {function decimals() external view returns (uint8 dec);}}
+use crate::{config::Config, WSEI, USDC};
+
+sol! {
+    #[sol(rpc)]
+    interface IV2Pool {
+        function token0() external view returns (address token);
+        function token1() external view returns (address token);
+        function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint32 blockTimestampLast);
+    }
+
+    #[sol(rpc)]
+    interface IERC20 {
+        function decimals() external view returns (uint8 dec);
+    }
+}
 
 /// Discovered pool candidate with metadata for safety evaluation.
 #[derive(Debug, Clone)]
@@ -75,11 +90,15 @@ impl FactoryScanner {
     }
 
     /// Scan the most recent `scan_window` pairs from every configured factory.
-    pub async fn scan_recent_pairs<P: Provider<PubSubFrontend>>(
+    pub async fn scan_recent_pairs<T, P>(
         &self,
         provider: &P,
         weth_price_usd: f64,
-    ) -> Vec<DiscoveredPool> {
+    ) -> Vec<DiscoveredPool>
+    where
+        P: Provider<T, Ethereum>,
+        T: Transport + Clone,
+    {
         let mut discovered = Vec::new();
 
         for factory_meta in &self.factories {
@@ -137,13 +156,17 @@ impl FactoryScanner {
         discovered
     }
 
-    async fn evaluate_pool<P: Provider<PubSubFrontend>>(
+    async fn evaluate_pool<T, P>(
         &self,
         provider: &P,
         pool_addr: Address,
         meta: &FactoryMeta,
         weth_price_usd: f64,
-    ) -> Option<DiscoveredPool> {
+    ) -> Option<DiscoveredPool>
+    where
+        P: Provider<T, Ethereum>,
+        T: Transport + Clone,
+    {
         let pool = IV2Pool::new(pool_addr, provider);
 
         let token0 = match pool.token0().call().await {
@@ -199,12 +222,16 @@ impl FactoryScanner {
     }
 
     /// Backwards-compatible wrapper; delegates to `scan_recent_pairs`.
-    pub async fn discover_long_tail_pairs<P: Provider<PubSubFrontend>>(
+    pub async fn discover_long_tail_pairs<T, P>(
         &self,
         provider: &P,
         _seed_tokens: &[Address],
         weth_price_usd: f64,
-    ) -> Vec<DiscoveredPool> {
+    ) -> Vec<DiscoveredPool>
+    where
+        P: Provider<T, Ethereum>,
+        T: Transport + Clone,
+    {
         self.scan_recent_pairs(provider, weth_price_usd).await
     }
 
@@ -238,7 +265,11 @@ impl FactoryScanner {
         }
     }
 
-    async fn fetch_decimals<P: Provider<PubSubFrontend>>(provider: &P, token: Address) -> u32 {
+    async fn fetch_decimals<T, P>(provider: &P, token: Address) -> u32
+    where
+        P: Provider<T, Ethereum>,
+        T: Transport + Clone,
+    {
         let contract = IERC20::new(token, provider);
         match contract.decimals().call().await {
             Ok(result) => result.dec as u32,
@@ -250,12 +281,16 @@ impl FactoryScanner {
     }
 
     /// Spawn a background task that rescans factories every hour.
-    pub fn spawn_hourly_scan<P: Provider<PubSubFrontend> + 'static>(
+    pub fn spawn_hourly_scan<T, P>(
         self,
         provider: std::sync::Arc<P>,
         weth_price_usd: std::sync::Arc<tokio::sync::RwLock<f64>>,
         tx: tokio::sync::mpsc::Sender<DiscoveredPool>,
-    ) -> tokio::task::JoinHandle<()> {
+    ) -> tokio::task::JoinHandle<()>
+    where
+        P: Provider<T, Ethereum> + 'static,
+        T: Transport + Clone + 'static,
+    {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
             loop {

@@ -10,6 +10,7 @@ use alloy::{
     rpc::types::eth::Filter,
     sol,
 };
+use reqwest::Url;
 use futures_util::StreamExt;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -183,9 +184,9 @@ impl BotStats {
         info!("║ ⏱  Uptime: {} minutes                            ", elapsed_secs / 60);
         info!("║ 🧱 Blocks seen: {}                               ", blocks);
         info!("║ 🔄 Total swaps detected: {}                      ", swaps);
-        info!("║    ├─ Uniswap V3: {}                             ", uni);
-        info!("║    ├─ Aerodrome CL: {}                           ", aero_cl);
-        info!("║    └─ Aerodrome V2: {}                           ", uni_v2);
+        info!("║    ├─ Sei CL: {}                                 ", uni);
+        info!("║    ├─ Sei Stable: {}                             ", aero_cl);
+        info!("║    └─ DragonSwap V2: {}                          ", uni_v2);
         info!("║ 📋 Active tracked pools: {}                      ", tracked);
         info!("║ 🎯 Arbitrage opportunities: {}                   ", opps);
         info!("║ 💰 Profitable (after fees): {}                   ", profitable);
@@ -825,10 +826,15 @@ async fn main() -> Result<(), eyre::Report> {
     let stats = Arc::new(BotStats::new());
     let start_time = Instant::now();
 
-    // Connect to provider
+    // Connect to WSS provider for event subscriptions
     let ws = WsConnect::new(&wss_url);
     let provider = ProviderBuilder::new().on_ws(ws).await?;
     let provider = Arc::new(provider);
+
+    // Create HTTP provider for eth_call operations (WSS returns empty bytes on Sei)
+    let http_url: Url = config.http_rpc_url.parse().expect("Invalid HTTP RPC URL");
+    let http_provider = ProviderBuilder::new().on_http(http_url);
+    let http_provider = Arc::new(http_provider);
 
     // Warm decimals for all tracked tokens from on-chain
     registry.warm_decimals(provider.as_ref()).await;
@@ -845,10 +851,10 @@ async fn main() -> Result<(), eyre::Report> {
     // Initial WSEI price for liquidity estimation (will be refined later)
     let initial_wsei_price = 0.05;
 
-    // Discover all V2 pools with sufficient liquidity
+    // Discover all V2 pools with sufficient liquidity (use HTTP provider for eth_call)
     let scanner = FactoryScanner::from_config(&config);
     let discovered = scanner.discover_long_tail_pairs(
-        provider.as_ref(),
+        http_provider.as_ref(),
         &seed_tokens,
         initial_wsei_price,
     ).await;
@@ -1063,7 +1069,7 @@ async fn main() -> Result<(), eyre::Report> {
                 // Determine which event type this is and decode accordingly
                 let mut opportunities = Vec::new();
                 if topic0 == UNISWAP_V3_SWAP_TOPIC {
-                    // This covers both Uniswap V3 AND Aerodrome CL (Slipstream) pools
+                    // This covers concentrated-liquidity pools (V3-style) on Sei
                     // since they emit the exact same Swap event signature
                     stats.swaps_detected.fetch_add(1, Ordering::Relaxed);
                     let is_aero_cl = registry.pools.get(&pool_address)
