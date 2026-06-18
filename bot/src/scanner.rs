@@ -9,6 +9,37 @@ use alloy::{
 use tracing::{info, warn};
 
 use crate::{config::Config, WSEI, USDC};
+/// Retry a raw eth_call up to `max_retries` times with fixed 2-second sleep.
+/// Returns Ok(bytes) on success, Err(last_error) after exhaustion.
+async fn retry_eth_call<T, P>(
+    provider: &P,
+    tx: &alloy::rpc::types::eth::TransactionRequest,
+    max_retries: usize,
+) -> Result<alloy::primitives::Bytes, Box<dyn std::error::Error + Send + Sync>>
+where
+    P: Provider<T, Ethereum>,
+    T: Transport + Clone,
+{
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for attempt in 0..max_retries {
+        match provider.call(tx).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) => {
+                let msg = format!("{}", e);
+                if msg.contains("-32000") || msg.to_lowercase().contains("rate limit") || msg.to_lowercase().contains("server busy") {
+                    warn!("RPC rate limit (attempt {}/{}), retrying in 2s...", attempt + 1, max_retries);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    last_err = Some(Box::new(e));
+                } else {
+                    return Err(Box::new(e));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "retry exhausted".into()))
+}
+
+
 
 sol! {
     #[sol(rpc)]
@@ -106,7 +137,7 @@ impl FactoryScanner {
             let tx_len = TransactionRequest::default()
                 .to(factory_meta.address)
                 .input(Bytes::from_static(&[0x57, 0x4f, 0x2b, 0xa3]).into());
-            let total_pairs = match provider.call(&tx_len).await {
+            let total_pairs = match retry_eth_call(provider, &tx_len, 5).await {
                 Ok(bytes) => {
                     if bytes.len() < 32 {
                         warn!("Factory {} returned {} bytes for allPairsLength, expected 32", factory_meta.dex_name, bytes.len());
@@ -136,7 +167,7 @@ impl FactoryScanner {
                 let tx_pair = TransactionRequest::default()
                     .to(factory_meta.address)
                     .input(Bytes::from(call_data).into());
-                let pool_addr = match provider.call(&tx_pair).await {
+                let pool_addr = match retry_eth_call(provider, &tx_pair, 5).await {
                     Ok(bytes) => {
                         if bytes.len() < 32 {
                             continue;

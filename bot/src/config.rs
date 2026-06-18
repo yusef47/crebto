@@ -6,8 +6,10 @@ use std::str::FromStr;
 pub struct Config {
     /// WebSocket RPC endpoint (e.g. wss://evm-ws.sei-apis.com)
     pub ws_rpc_url: String,
-    /// HTTP RPC endpoint (e.g. https://evm-rpc.sei-apis.com)
+    /// HTTP RPC endpoint (e.g. https://sei-evm-rpc.publicnode.com)
     pub http_rpc_url: String,
+    /// Fallback HTTP RPC endpoints tried in order if primary fails
+    pub http_rpc_fallbacks: Vec<String>,
     pub chain_id: u64,
     pub dry_run: bool,
     pub private_key: Option<String>,
@@ -57,7 +59,13 @@ impl Config {
 
         let http_rpc_url = env::var("HTTP_RPC_URL")
             .or_else(|_| env::var("ALCHEMY_HTTP"))
-            .unwrap_or_else(|_| ws_rpc_url.replace("wss://", "https://").replace("/ws/", "/"));
+            .unwrap_or_else(|_| {
+                if ws_rpc_url.contains("sei-apis") {
+                    "https://evm-rpc.sei-apis.com".to_string()
+                } else {
+                    ws_rpc_url.replace("wss://", "https://").replace("/ws/", "/")
+                }
+            });
 
         let chain_id = env::var("CHAIN_ID")
             .unwrap_or_else(|_| "1329".to_string())
@@ -182,6 +190,20 @@ impl Config {
             .parse::<f64>()
             .unwrap_or(10.0);
 
+        // Parse fallback RPC endpoints (comma-separated)
+        let http_rpc_fallbacks = env::var("HTTP_RPC_FALLBACKS")
+            .unwrap_or_else(|_| {
+                if ws_rpc_url.contains("sei-apis") {
+                    "https://sei-evm-rpc.publicnode.com,https://rpc.ankr.com/sei_evm".to_string()
+                } else {
+                    "".to_string()
+                }
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
         let max_trades_per_hour = env::var("MAX_TRADES_PER_HOUR")
             .unwrap_or_else(|_| "15".to_string())
             .parse::<u32>()
@@ -190,6 +212,7 @@ impl Config {
         Ok(Self {
             ws_rpc_url,
             http_rpc_url,
+            http_rpc_fallbacks,
             chain_id,
             dry_run,
             private_key,
