@@ -12,7 +12,7 @@ mod rpc_rotator;
 mod liquidation_monitor;
 mod bundle_builder;
 mod simulator;
-mod mev_share;
+
 mod persistence;
 
 use crate::{

@@ -15,7 +15,6 @@ use crate::{
     config::Config,
     contracts::IMEVExecutor,
     liquidation_monitor::LiquidationOpportunity,
-    mev_share::{MevBundle, MevShareSubmitter},
     simulator::simulate_liquidation,
     rpc_rotator::RotatingProvider,
     persistence::BotCheckpoint,
@@ -122,15 +121,14 @@ impl BundleBuilder {
                 }
             };
 
-            let bundle = MevBundle {
-                signed_txs: vec![signed_tx],
-                block_target,
-                refund_address: s.address(),
-                refund_percent: 100,
-            };
-
-            if let Err(e) = MevShareSubmitter::submit(&bundle, &config.mev_share_endpoint).await {
-                warn!("Bundle submission failed: {}", e);
+            // Broadcast directly to Base mempool (MEV-Share does not exist on Base)
+            match best_provider.send_raw_transaction(signed_tx.as_slice()).await {
+                Ok(pending_tx) => {
+                    info!("✅ Transaction broadcasted! TX Hash: {:?}", pending_tx.tx_hash());
+                }
+                Err(e) => {
+                    warn!("❌ Transaction submission failed: {}", e);
+                }
             }
         }
 
