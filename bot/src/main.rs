@@ -6,7 +6,6 @@
 use alloy::{
     primitives::{address, Address, B256, U256},
     providers::{Provider, ProviderBuilder, WsConnect},
-    pubsub::PubSubFrontend,
     rpc::types::eth::Filter,
     sol,
 };
@@ -199,12 +198,16 @@ impl BotStats {
 /// Cold-boot reserve sync via Multicall3.
 /// Batches getReserves() calls for all safe pools and updates existing registry entries.
 /// Only updates already-registered pools to avoid double-registration.
-async fn cold_boot_pool_states<P: Provider<PubSubFrontend>>(
+async fn cold_boot_pool_states<T, P>(
     provider: &P,
     registry: &mut PoolRegistry,
     pools: &[scanner::DiscoveredPool],
     multicall3_addr: Option<Address>,
-) {
+)
+where
+    T: alloy::transports::Transport + Clone,
+    P: Provider<T, alloy::network::Ethereum>,
+{
     let Some(mc_addr) = multicall3_addr else {
         info!("Multicall3 not configured; skipping cold-boot batch sync.");
         return;
@@ -605,7 +608,11 @@ impl PoolRegistry {
         info!("Pool Registry initialized (empty) - awaiting scanner discovery");
     }
 
-    async fn warm_decimals<P: Provider<PubSubFrontend>>(&mut self, provider: &P) {
+    async fn warm_decimals<T, P>(&mut self, provider: &P)
+    where
+        T: alloy::transports::Transport + Clone,
+        P: Provider<T, alloy::network::Ethereum>,
+    {
         let tokens: Vec<Address> = self.pools.values()
             .flat_map(|p| [p.token0, p.token1])
             .filter(|t| !self.decimals_cache.contains_key(t))
@@ -857,9 +864,10 @@ async fn main() -> Result<(), eyre::Report> {
         }
         provider.expect("All HTTP RPC endpoints failed")
     };
+    let http_provider = Arc::new(http_provider);
 
     // Warm decimals for all tracked tokens from on-chain
-    registry.warm_decimals(provider.as_ref()).await;
+    registry.warm_decimals(&http_provider).await;
     info!("🔢 Decimals warmed for {} tokens", registry.decimals_cache.len());
 
     info!("DRY RUN MODE: {}", config.dry_run);
@@ -1004,7 +1012,7 @@ async fn main() -> Result<(), eyre::Report> {
 
     // If we injected the fallback pool, fetch its real reserves from chain now
     if !safe_discovered.is_empty() && safe_discovered[0].address == address!("0xa97b36c4ddd400e9726f2d960cf4e8aac4746194") {
-        let backup_pool = IAerodromeV2Pool::new(safe_discovered[0].address, provider.as_ref());
+        let backup_pool = IAerodromeV2Pool::new(safe_discovered[0].address, &http_provider);
         if let Ok(res) = backup_pool.getReserves().call().await {
             if let Some(p) = registry.pools.get_mut(&safe_discovered[0].address) {
                 p.reserve0 = res.reserve0;
@@ -1016,7 +1024,7 @@ async fn main() -> Result<(), eyre::Report> {
     }
 
     // v0.7: Cold-boot reserve sync via Multicall3 for all safe pools (under 5 seconds)
-    cold_boot_pool_states(provider.as_ref(), &mut registry, &safe_discovered, config.multicall3).await;
+    cold_boot_pool_states(&http_provider, &mut registry, &safe_discovered, config.multicall3).await;
 
     // Fetch initial WSEI price from a WSEI/USDC V2 volatile pool (more reliable than Chainlink on Base)
     let weth_price_usd = Arc::new(RwLock::new(0.05));
@@ -1036,7 +1044,7 @@ async fn main() -> Result<(), eyre::Report> {
     }
 
     if let Some(oracle) = price_oracle_pool {
-        let v2_pool = IAerodromeV2Pool::new(oracle, provider.as_ref());
+        let v2_pool = IAerodromeV2Pool::new(oracle, http_provider.as_ref());
         match v2_pool.getReserves().call().await {
             Ok(reserves) => {
                 let r0 = reserves.reserve0.to::<u128>() as f64;
@@ -1059,14 +1067,14 @@ async fn main() -> Result<(), eyre::Report> {
 
     // Spawn periodic WSEI price update task from the same V2 pool
     let price_clone = weth_price_usd.clone();
-    let provider_clone = provider.clone();
+    let http_provider_clone = http_provider.clone();
     let oracle_clone = price_oracle_pool;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
             if let Some(oracle) = oracle_clone {
-                let v2_pool = IAerodromeV2Pool::new(oracle, provider_clone.as_ref());
+                let v2_pool = IAerodromeV2Pool::new(oracle, http_provider_clone.as_ref());
                 match v2_pool.getReserves().call().await {
                     Ok(reserves) => {
                         let r0 = reserves.reserve0.to::<u128>() as f64;

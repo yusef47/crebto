@@ -1,8 +1,9 @@
 use alloy::{
+    network::Ethereum,
     primitives::{Address, Bytes},
     providers::Provider,
-    pubsub::PubSubFrontend,
     sol,
+    transports::Transport,
 };
 use eyre::Result;
 
@@ -25,11 +26,15 @@ sol! {
 /// Aggregate multiple static calls via Multicall3.
 /// Uses aggregate3 so individual call failures do not revert the entire batch.
 /// Returns a vector of (success, return_data) tuples in the same order as `calls`.
-pub async fn multicall3_aggregate3<P: Provider<PubSubFrontend>>(
+pub async fn multicall3_aggregate3<T, P>(
     provider: &P,
     multicall3: Address,
     calls: Vec<(Address, Bytes)>,
-) -> Result<Vec<(bool, Bytes)>> {
+) -> Result<Vec<(bool, Bytes)>>
+where
+    T: Transport + Clone,
+    P: Provider<T, Ethereum>,
+{
     if calls.is_empty() {
         return Ok(Vec::new());
     }
