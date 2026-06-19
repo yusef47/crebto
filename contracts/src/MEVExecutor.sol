@@ -186,7 +186,7 @@ contract MEVExecutor is ReentrancyGuard, Ownable {
     // ═══════════════════════════════════════════════════════
 
     function _sweepProfitToOwner(address token, uint256 amount) internal {
-        if (amount == 1) return;
+        if (amount == 0) return;
         IERC20(token).safeTransfer(owner(), amount);
         emit ProfitSwept(amount);
     }

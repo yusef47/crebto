@@ -110,10 +110,17 @@ impl BundleBuilder {
                 ..Default::default()
             };
 
-            let sig = s.sign_transaction(&mut tx).await?;
-            let signed = tx.into_signed(sig);
-            let envelope: TxEnvelope = signed.into();
-            let signed_tx = envelope.encoded_2718();
+            let signed_tx = match s.sign_transaction(&mut tx).await {
+                Ok(sig) => {
+                    let signed = tx.into_signed(sig);
+                    let envelope: TxEnvelope = signed.into();
+                    envelope.encoded_2718()
+                }
+                Err(e) => {
+                    warn!("❌ Transaction signing failed: {}", e);
+                    continue;
+                }
+            };
 
             let bundle = MevBundle {
                 signed_txs: vec![signed_tx],

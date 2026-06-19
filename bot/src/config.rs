@@ -67,7 +67,7 @@ impl Config {
             .unwrap_or_else(|| Address::from_str("0x0000000000000000000000000000000000000000").unwrap());
 
         let mev_share_endpoint = env::var("MEV_SHARE_ENDPOINT")
-            .unwrap_or_else(|_| "https://mev-share.flashbots.net/".to_string());
+            .unwrap_or_else(|_| "https://mev-share-hilo.flashbots.net/".to_string());
 
         let bot_private_key = env::var("BOT_PRIVATE_KEY").ok();
 
