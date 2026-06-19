@@ -897,8 +897,8 @@ async fn main() -> Result<(), eyre::Report> {
         info!("⚠️  Factory scan empty — injecting hardcoded WSEI/USDC backup pool for dry-run");
         let backup = scanner::DiscoveredPool {
             address: address!("0xa97b36c4ddd400e9726f2d960cf4e8aac4746194"),
-            token0: WSEI,
-            token1: USDC,
+            token0: USDC,
+            token1: WSEI,
             reserve0: U256::ZERO, // will be fetched live below
             reserve1: U256::ZERO,
             fee_bps: 30,
@@ -1045,20 +1045,25 @@ async fn main() -> Result<(), eyre::Report> {
 
     if let Some(oracle) = price_oracle_pool {
         let v2_pool = IAerodromeV2Pool::new(oracle, http_provider.as_ref());
+        let oracle_pool = registry.pools.get(&oracle).expect("oracle pool must exist");
+        let is_wsei_token0 = oracle_pool.token0 == WSEI;
         match v2_pool.getReserves().call().await {
             Ok(reserves) => {
-                let r0 = reserves.reserve0.to::<u128>() as f64;
-                let r1 = reserves.reserve1.to::<u128>() as f64;
-                let price = (r1 / 1e6) / (r0 / 1e18);
+                let (wsei_reserve, usdc_reserve) = if is_wsei_token0 {
+                    (reserves.reserve0, reserves.reserve1)
+                } else {
+                    (reserves.reserve1, reserves.reserve0)
+                };
+                let price = (usdc_reserve.to::<u128>() as f64 / 1e6) / (wsei_reserve.to::<u128>() as f64 / 1e18);
                 if price > 0.0 && price.is_finite() {
-                    info!("🔗 WSEI/USD price from V2 pool: ${:.2}", price);
+                    info!("🔗 WSEI/USD price from V2 pool: ${:.6}", price);
                     *weth_price_usd.write().await = price;
                 } else {
-                    warn!("⚠️ V2 pool returned invalid price, using fallback 2500");
+                    warn!("⚠️ V2 pool returned invalid price, using fallback ${:.2}", initial_wsei_price);
                 }
             }
             Err(e) => {
-                warn!("⚠️ Failed to fetch price from V2 pool, using fallback 2500: {}", e);
+                warn!("⚠️ Failed to fetch price from V2 pool, using fallback ${:.2}: {}", initial_wsei_price, e);
             }
         }
     } else {
@@ -1069,6 +1074,7 @@ async fn main() -> Result<(), eyre::Report> {
     let price_clone = weth_price_usd.clone();
     let http_provider_clone = http_provider.clone();
     let oracle_clone = price_oracle_pool;
+    let is_wsei_token0_bg = price_oracle_pool.and_then(|addr| registry.pools.get(&addr).map(|p| p.token0 == WSEI));
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
         loop {
@@ -1077,9 +1083,13 @@ async fn main() -> Result<(), eyre::Report> {
                 let v2_pool = IAerodromeV2Pool::new(oracle, http_provider_clone.as_ref());
                 match v2_pool.getReserves().call().await {
                     Ok(reserves) => {
-                        let r0 = reserves.reserve0.to::<u128>() as f64;
-                        let r1 = reserves.reserve1.to::<u128>() as f64;
-                        let price = (r1 / 1e6) / (r0 / 1e18);
+                        let is_wsei_t0 = is_wsei_token0_bg.unwrap_or(false);
+                        let (wsei_reserve, usdc_reserve) = if is_wsei_t0 {
+                            (reserves.reserve0, reserves.reserve1)
+                        } else {
+                            (reserves.reserve1, reserves.reserve0)
+                        };
+                        let price = (usdc_reserve.to::<u128>() as f64 / 1e6) / (wsei_reserve.to::<u128>() as f64 / 1e18);
                         if price > 0.0 && price.is_finite() {
                             *price_clone.write().await = price;
                         }
