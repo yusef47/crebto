@@ -81,7 +81,7 @@ async fn main() -> eyre::Result<()> {
     });
 
     // ── Wait for tasks ──
-    tokio::try_join!(monitor_handle, builder_handle)?;
+    let _ = tokio::try_join!(monitor_handle, builder_handle)?;
 
     Ok(())
 }

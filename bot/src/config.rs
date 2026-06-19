@@ -14,8 +14,8 @@ pub struct Config {
     pub executor_address: Address,
     /// Free RPC endpoints to rotate through
     pub rpc_urls: Vec<String>,
-    /// MEV-Share endpoint
-    pub mev_share_endpoint: String,
+    /// Base RPC endpoint for direct tx broadcast (MEV-Share does not exist on Base)
+    pub rpc_broadcast_url: String,
     /// Bot wallet private key (hex, no 0x prefix)
     pub bot_private_key: Option<String>,
     /// Polling interval in seconds (10s for Kaggle free tier)
@@ -66,8 +66,8 @@ impl Config {
             .and_then(|s| Address::from_str(&s).ok())
             .unwrap_or_else(|| Address::from_str("0x0000000000000000000000000000000000000000").unwrap());
 
-        let mev_share_endpoint = env::var("MEV_SHARE_ENDPOINT")
-            .unwrap_or_else(|_| "https://mev-share-hilo.flashbots.net/".to_string());
+        let rpc_broadcast_url = env::var("RPC_BROADCAST_URL")
+            .unwrap_or_else(|_| "https://base-rpc.publicnode.com".to_string());
 
         let bot_private_key = env::var("BOT_PRIVATE_KEY").ok();
 
@@ -137,7 +137,7 @@ impl Config {
             balancer_vault,
             executor_address,
             rpc_urls,
-            mev_share_endpoint,
+            rpc_broadcast_url,
             bot_private_key,
             poll_interval_secs,
             max_borrowers,
