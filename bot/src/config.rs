@@ -4,245 +4,152 @@ use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// WebSocket RPC endpoint (e.g. wss://evm-ws.sei-apis.com)
-    pub ws_rpc_url: String,
-    /// HTTP RPC endpoint (e.g. https://sei-evm-rpc.publicnode.com)
-    pub http_rpc_url: String,
-    /// Fallback HTTP RPC endpoints tried in order if primary fails
-    pub http_rpc_fallbacks: Vec<String>,
+    /// Target chain ID (Base mainnet = 8453, Base Sepolia = 84532)
     pub chain_id: u64,
+    /// Aave V3 Pool address on Base
+    pub aave_pool: Address,
+    /// Balancer V2 Vault address on Base
+    pub balancer_vault: Address,
+    /// MEVExecutor.sol deployment address
+    pub executor_address: Address,
+    /// Free RPC endpoints to rotate through
+    pub rpc_urls: Vec<String>,
+    /// MEV-Share endpoint
+    pub mev_share_endpoint: String,
+    /// Bot wallet private key (hex, no 0x prefix)
+    pub bot_private_key: Option<String>,
+    /// Polling interval in seconds (10s for Kaggle free tier)
+    pub poll_interval_secs: u64,
+    /// Max borrowers in watchlist
+    pub max_borrowers: usize,
+    /// Multicall batch size
+    pub multicall_batch_size: usize,
+    /// Health factor threshold to trigger liquidation (0.98 = 0.98 * 1e18)
+    pub hf_threshold: u128,
+    /// Min debt size in USD (1e8 = $1 USDC)
+    pub min_debt_usd: u128,
+    /// Max debt size in USD (micro-liquidation cap)
+    pub max_debt_usd: u128,
+    /// DRY_RUN mode: true = simulate only, false = submit bundles
     pub dry_run: bool,
-    pub private_key: Option<String>,
-    pub executor_address: Option<Address>,
-    pub contract_address: Option<Address>,
-    pub telegram_bot_token: Option<String>,
-    pub telegram_chat_id: Option<String>,
-    pub max_gas_price_gwei: u64,
-    pub min_eth_balance: f64,
-    pub max_loss_per_hour_usd: f64,
-    pub max_consecutive_failures: u32,
-    pub min_profit_usd: f64,
-    pub require_simulation: bool,
-    pub enable_live_send: bool,
-    pub uniswap_v3_router: Option<Address>,
-    pub aerodrome_router: Option<Address>,
-    pub aerodrome_slipstream_router: Option<Address>,
-    pub aerodrome_factory: Option<Address>,
-    pub saphyre_factory: Option<Address>,
-    pub dragonswap_factory: Option<Address>,
-    pub multicall3: Option<Address>,
-    pub execution_gas_limit: u64,
-    pub slippage_bps: u32,
-    pub probe_sizes_usd: Vec<f64>,
-    // Safety & live trading controls
-    pub min_liquidity_usd: f64,
-    pub max_liquidity_usd: f64,
-    pub max_tax_bps: u32,
-    pub max_daily_loss_usd: f64,
-    pub max_trades_per_hour: u32,
-    pub liquidity_locker: Option<Address>,
+    /// Path to save checkpoint JSON
+    pub checkpoint_path: String,
+    /// Path to load watchlist JSON
+    pub watchlist_path: String,
+    /// Base gas price estimate in wei (for simulation)
+    pub gas_price_wei: u64,
+    /// Max gas per liquidation tx
+    pub max_gas: u64,
 }
 
 impl Config {
-    pub fn load_from_env() -> Result<Self, eyre::Report> {
+    pub fn from_env() -> Result<Self, eyre::Report> {
         let _ = dotenvy::dotenv();
+
+        let chain_id = env::var("CHAIN_ID")
+            .unwrap_or_else(|_| "8453".to_string())
+            .parse::<u64>()
+            .unwrap_or(8453);
+
+        let aave_pool = env::var("AAVE_POOL")
+            .unwrap_or_else(|_| "0xA238Dd80C22bdDf7D0EefB651440Ff9bA1D94454".to_string())
+            .parse()
+            .map_err(|_| eyre::eyre!("Invalid AAVE_POOL"))?;
+
+        let balancer_vault = env::var("BALANCER_VAULT")
+            .unwrap_or_else(|_| "0xBA12222222228d8Ba445958a75A0704d566BF2C8".to_string())
+            .parse()
+            .map_err(|_| eyre::eyre!("Invalid BALANCER_VAULT"))?;
+
+        let executor_address = env::var("EXECUTOR_ADDRESS")
+            .ok()
+            .and_then(|s| Address::from_str(&s).ok())
+            .unwrap_or_else(|| Address::from_str("0x0000000000000000000000000000000000000000").unwrap());
+
+        let mev_share_endpoint = env::var("MEV_SHARE_ENDPOINT")
+            .unwrap_or_else(|_| "https://mev-share.flashbots.net/".to_string());
+
+        let bot_private_key = env::var("BOT_PRIVATE_KEY").ok();
+
+        let rpc_urls: Vec<String> = env::var("RPC_URLS")
+            .unwrap_or_else(|_| {
+                "https://base-mainnet.g.alchemy.com/v2/demo,https://base.drpc.org,https://base-rpc.publicnode.com".to_string()
+            })
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse::<u64>()
+            .unwrap_or(10);
+
+        let max_borrowers = env::var("MAX_BORROWERS")
+            .unwrap_or_else(|_| "300".to_string())
+            .parse::<usize>()
+            .unwrap_or(300);
+
+        let multicall_batch_size = env::var("MULTICALL_BATCH_SIZE")
+            .unwrap_or_else(|_| "25".to_string())
+            .parse::<usize>()
+            .unwrap_or(25);
+
+        let hf_threshold = env::var("HF_THRESHOLD")
+            .unwrap_or_else(|_| "980000000000000000".to_string())
+            .parse::<u128>()
+            .unwrap_or(980_000_000_000_000_000u128);
+
+        let min_debt_usd = env::var("MIN_DEBT_USD")
+            .unwrap_or_else(|_| "100000000000".to_string()) // $1,000 * 1e8
+            .parse::<u128>()
+            .unwrap_or(100_000_000_000u128);
+
+        let max_debt_usd = env::var("MAX_DEBT_USD")
+            .unwrap_or_else(|_| "500000000000".to_string()) // $5,000 * 1e8
+            .parse::<u128>()
+            .unwrap_or(500_000_000_000u128);
 
         let dry_run = env::var("DRY_RUN")
             .unwrap_or_else(|_| "true".to_string())
             .parse::<bool>()
             .unwrap_or(true);
 
-        // Backward-compat: accept ALCHEMY_WSS/ALCHEMY_HTTP, but prefer WS_RPC_URL / HTTP_RPC_URL
-        let ws_rpc_url = env::var("WS_RPC_URL")
-            .or_else(|_| env::var("ALCHEMY_WSS"))
-            .unwrap_or_else(|_| "wss://evm-ws.sei-apis.com".to_string());
+        let checkpoint_path = env::var("CHECKPOINT_PATH")
+            .unwrap_or_else(|_| "/kaggle/working/bot_checkpoint.json".to_string());
 
-        let http_rpc_url = env::var("HTTP_RPC_URL")
-            .or_else(|_| env::var("ALCHEMY_HTTP"))
-            .unwrap_or_else(|_| {
-                if ws_rpc_url.contains("sei-apis") {
-                    "https://sei-evm-rpc.publicnode.com".to_string()
-                } else {
-                    ws_rpc_url.replace("wss://", "https://").replace("/ws/", "/")
-                }
-            });
+        let watchlist_path = env::var("WATCHLIST_PATH")
+            .unwrap_or_else(|_| "/kaggle/working/watchlist.json".to_string());
 
-        let chain_id = env::var("CHAIN_ID")
-            .unwrap_or_else(|_| "1329".to_string())
+        let gas_price_wei = env::var("GAS_PRICE_WEI")
+            .unwrap_or_else(|_| "500000000".to_string()) // 0.5 gwei
             .parse::<u64>()
-            .unwrap_or(1329);
+            .unwrap_or(500_000_000);
 
-        let private_key = env::var("PRIVATE_KEY").ok();
-
-        let executor_address = env::var("EXECUTOR_ADDRESS")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let contract_address = env::var("CONTRACT_ADDRESS")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let telegram_bot_token = env::var("TELEGRAM_BOT_TOKEN").ok();
-        let telegram_chat_id = env::var("TELEGRAM_CHAT_ID").ok();
-
-        let max_gas_price_gwei = env::var("MAX_GAS_PRICE_GWEI")
-            .unwrap_or_else(|_| "100".to_string())
+        let max_gas = env::var("MAX_GAS")
+            .unwrap_or_else(|_| "400000".to_string())
             .parse::<u64>()
-            .unwrap_or(100);
-
-        let min_eth_balance = env::var("MIN_ETH_BALANCE")
-            .unwrap_or_else(|_| "0.005".to_string())
-            .parse::<f64>()
-            .unwrap_or(0.005);
-
-        let max_loss_per_hour_usd = env::var("MAX_LOSS_PER_HOUR_USD")
-            .unwrap_or_else(|_| "5.0".to_string())
-            .parse::<f64>()
-            .unwrap_or(5.0);
-
-        let max_consecutive_failures = env::var("MAX_CONSECUTIVE_FAILURES")
-            .unwrap_or_else(|_| "50".to_string())
-            .parse::<u32>()
-            .unwrap_or(50);
-
-        let min_profit_usd = env::var("MIN_PROFIT_USD")
-            .unwrap_or_else(|_| "0.20".to_string())
-            .parse::<f64>()
-            .unwrap_or(0.20);
-
-        let require_simulation = env::var("REQUIRE_SIMULATION")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse::<bool>()
-            .unwrap_or(true);
-
-        let enable_live_send = env::var("ENABLE_LIVE_SEND")
-            .unwrap_or_else(|_| "false".to_string())
-            .parse::<bool>()
-            .unwrap_or(false);
-
-        let uniswap_v3_router = env::var("UNISWAP_V3_ROUTER")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let aerodrome_router = env::var("AERODROME_ROUTER")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let aerodrome_slipstream_router = env::var("AERODROME_SLIPSTREAM_ROUTER")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok())
-            .or(aerodrome_router);
-
-        let aerodrome_factory = env::var("AERODROME_FACTORY")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let saphyre_factory = env::var("SAPPHIRE_FACTORY")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let dragonswap_factory = env::var("DRAGONSWAP_FACTORY")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let multicall3 = env::var("MULTICALL3")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let liquidity_locker = env::var("LIQUIDITY_LOCKER")
-            .ok()
-            .and_then(|s| Address::from_str(&s).ok());
-
-        let execution_gas_limit = env::var("EXECUTION_GAS_LIMIT")
-            .unwrap_or_else(|_| "600000".to_string())
-            .parse::<u64>()
-            .unwrap_or(600_000);
-
-        let slippage_bps = env::var("SLIPPAGE_BPS")
-            .unwrap_or_else(|_| "15".to_string())
-            .parse::<u32>()
-            .unwrap_or(15);
-
-        let probe_sizes_usd = env::var("PROBE_SIZES_USD")
-            .unwrap_or_else(|_| "50,100".to_string())
-            .split(',')
-            .filter_map(|raw| raw.trim().parse::<f64>().ok())
-            .filter(|value| *value > 0.0)
-            .collect::<Vec<_>>();
-
-        let min_liquidity_usd = env::var("MIN_LIQUIDITY_USD")
-            .unwrap_or_else(|_| "5000".to_string())
-            .parse::<f64>()
-            .unwrap_or(5000.0);
-
-        let max_liquidity_usd = env::var("MAX_LIQUIDITY_USD")
-            .unwrap_or_else(|_| "30000".to_string())
-            .parse::<f64>()
-            .unwrap_or(30_000.0);
-
-        let max_tax_bps = env::var("MAX_TAX_BPS")
-            .unwrap_or_else(|_| "500".to_string())
-            .parse::<u32>()
-            .unwrap_or(500);
-
-        let max_daily_loss_usd = env::var("MAX_DAILY_LOSS_USD")
-            .unwrap_or_else(|_| "10.0".to_string())
-            .parse::<f64>()
-            .unwrap_or(10.0);
-
-        // Parse fallback RPC endpoints (comma-separated)
-        let http_rpc_fallbacks = env::var("HTTP_RPC_FALLBACKS")
-            .unwrap_or_else(|_| {
-                if ws_rpc_url.contains("sei-apis") {
-                    "https://sei-evm-rpc.publicnode.com,https://rpc.ankr.com/sei_evm".to_string()
-                } else {
-                    "".to_string()
-                }
-            })
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
-
-        let max_trades_per_hour = env::var("MAX_TRADES_PER_HOUR")
-            .unwrap_or_else(|_| "15".to_string())
-            .parse::<u32>()
-            .unwrap_or(15);
+            .unwrap_or(400_000);
 
         Ok(Self {
-            ws_rpc_url,
-            http_rpc_url,
-            http_rpc_fallbacks,
             chain_id,
-            dry_run,
-            private_key,
+            aave_pool,
+            balancer_vault,
             executor_address,
-            contract_address,
-            telegram_bot_token,
-            telegram_chat_id,
-            max_gas_price_gwei,
-            min_eth_balance,
-            max_loss_per_hour_usd,
-            max_consecutive_failures,
-            min_profit_usd,
-            require_simulation,
-            enable_live_send,
-            uniswap_v3_router,
-            aerodrome_router,
-            aerodrome_slipstream_router,
-            aerodrome_factory,
-            saphyre_factory,
-            dragonswap_factory,
-            multicall3,
-            execution_gas_limit,
-            slippage_bps,
-            probe_sizes_usd,
-            min_liquidity_usd,
-            max_liquidity_usd,
-            max_tax_bps,
-            max_daily_loss_usd,
-            max_trades_per_hour,
-            liquidity_locker,
+            rpc_urls,
+            mev_share_endpoint,
+            bot_private_key,
+            poll_interval_secs,
+            max_borrowers,
+            multicall_batch_size,
+            hf_threshold,
+            min_debt_usd,
+            max_debt_usd,
+            dry_run,
+            checkpoint_path,
+            watchlist_path,
+            gas_price_wei,
+            max_gas,
         })
     }
 }

@@ -1,0 +1,119 @@
+use std::str::FromStr;
+use alloy::{
+    primitives::{Address, U256},
+};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::time::{interval, Duration};
+use tracing::{info, warn};
+
+use crate::{
+    config::Config,
+    contracts::IAavePool,
+    rpc_rotator::RotatingProvider,
+    persistence::BotCheckpoint,
+};
+
+/// Micro-liquidation opportunity detected by the monitor.
+#[derive(Debug, Clone)]
+pub struct LiquidationOpportunity {
+    pub user: Address,
+    pub collateral: Address,
+    pub debt: Address,
+    pub debt_to_cover: U256,
+    pub total_debt_base: U256,
+    pub health_factor: U256,
+}
+
+pub struct LiquidationMonitor;
+
+impl LiquidationMonitor {
+    pub async fn run(
+        rpc: Arc<RotatingProvider>,
+        tx: mpsc::Sender<LiquidationOpportunity>,
+        config: Config,
+        mut checkpoint: BotCheckpoint,
+    ) -> eyre::Result<()> {
+        let _aave_pool = IAavePool::new(config.aave_pool, rpc.best_provider());
+        let mut tick = interval(Duration::from_secs(config.poll_interval_secs));
+
+        // Load or build watchlist
+        let watchlist = checkpoint.watchlist.clone();
+        let borrowers: Vec<Address> = if watchlist.is_empty() {
+            // If no checkpoint, load from file or use empty (subgraph scraper should pre-fill)
+            info!("Watchlist empty — bot will wait for watchlist.json to be populated");
+            vec![]
+        } else {
+            watchlist.iter()
+                .filter_map(|s| s.parse::<Address>().ok())
+                .collect()
+        };
+
+        if borrowers.is_empty() {
+            warn!("No borrowers in watchlist. Exiting monitor.");
+            return Ok(());
+        }
+
+        info!("🔍 LiquidationMonitor started: {} borrowers, {}s poll interval", borrowers.len(), config.poll_interval_secs);
+
+        loop {
+            tick.tick().await;
+
+            // Batch multicall for health factors
+            let batches = borrowers.chunks(config.multicall_batch_size);
+            for batch in batches {
+                let best_p = rpc.best_provider_owned();
+                let pool = IAavePool::new(config.aave_pool, &best_p);
+                let mut results = Vec::new();
+                for &user in batch {
+                    match pool.getUserAccountData(user).call().await {
+                        Ok(result) => results.push((user, result)),
+                        Err(_) => {}
+                    }
+                }
+
+                for (user, result) in results {
+                    let hf = result.healthFactor;  // healthFactor is 6th return value (index 5)
+                    let debt = result.totalDebtBase;  // totalDebtBase (index 1)
+                    let _collateral = result.totalCollateralBase;  // totalCollateralBase (index 2)
+
+                    // Filter: micro-liquidation criteria
+                    if hf < U256::from(config.hf_threshold)
+                        && debt >= U256::from(config.min_debt_usd)
+                        && debt <= U256::from(config.max_debt_usd)
+                    {
+                        info!(
+                            "💀 Liquidation candidate: user={:?}, hf={}, debt={}",
+                            user, hf, debt
+                        );
+
+                        // For simplicity, assume USDC debt and WETH collateral
+                        // In production, query Aave data engine for actual assets
+                        let opp = LiquidationOpportunity {
+                            user,
+                            collateral: Address::from_str("0x4200000000000000000000000000000000000006").unwrap(), // WETH Base
+                            debt: Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap(), // USDC Base
+                            debt_to_cover: debt, // 100% close factor if HF < 0.95
+                            total_debt_base: debt,
+                            health_factor: hf,
+                        };
+
+                        if tx.send(opp).await.is_err() {
+                            warn!("Liquidation channel closed");
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            // Save checkpoint every 10 ticks (~100s)
+            checkpoint.last_run_timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if let Err(e) = checkpoint.save(&config.checkpoint_path).await {
+                warn!("Failed to save checkpoint: {}", e);
+            }
+        }
+    }
+}
