@@ -1003,15 +1003,15 @@ async fn main() -> Result<(), eyre::Report> {
     );
 
     // If we injected the fallback pool, fetch its real reserves from chain now
-    if safe_discovered.len() == 1 && safe_discovered[0].address == address!("0xa97b36c4ddd400e9726f2d960cf4e8aac4746194") {
-        let backup_pool = IAerodromeV2Pool::new(safe_discovered[1].address, provider.as_ref());
+    if !safe_discovered.is_empty() && safe_discovered[0].address == address!("0xa97b36c4ddd400e9726f2d960cf4e8aac4746194") {
+        let backup_pool = IAerodromeV2Pool::new(safe_discovered[0].address, provider.as_ref());
         if let Ok(res) = backup_pool.getReserves().call().await {
-            registry.pools.get_mut(&safe_discovered[1].address).map(|p| {
+            if let Some(p) = registry.pools.get_mut(&safe_discovered[0].address) {
                 p.reserve0 = res.reserve0;
                 p.reserve1 = res.reserve1;
                 p.sqrt_price_x96 = sqrt_price_x96_from_reserves(res.reserve0, res.reserve1);
                 info!("🔗 Fallback pool reserves synced: r0={:?}, r1={:?}", res.reserve0, res.reserve1);
-            });
+            }
         }
     }
 
