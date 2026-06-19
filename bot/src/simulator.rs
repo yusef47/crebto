@@ -38,6 +38,7 @@ where
     let tx = TransactionRequest::default()
         .with_to(mev_executor)
         .with_from(mev_executor) // simulate as if executor calls itself
+        .with_value(U256::ZERO)
         .with_input(alloy::primitives::Bytes::from(call_data));
 
     match provider.call(&tx).await {

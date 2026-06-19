@@ -50,8 +50,12 @@ impl LiquidationMonitor {
         };
 
         if borrowers.is_empty() {
-            warn!("No borrowers in watchlist. Exiting monitor.");
-            return Ok(());
+            warn!("No borrowers in watchlist. Bot will idle and retry every 60s. Populate watchlist.json to start scanning.");
+            let mut idle = interval(Duration::from_secs(60));
+            loop {
+                idle.tick().await;
+                warn!("Still no borrowers in watchlist. Waiting...");
+            }
         }
 
         info!("🔍 LiquidationMonitor started: {} borrowers, {}s poll interval", borrowers.len(), config.poll_interval_secs);
@@ -89,11 +93,19 @@ impl LiquidationMonitor {
 
                         // For simplicity, assume USDC debt and WETH collateral
                         // In production, query Aave data engine for actual assets
+                        // Aave V3 close factor: 50% unless HF < 0.95 (deep underwater)
+                        let close_factor = if hf < U256::from(950_000_000_000_000_000u128) {
+                            U256::from(10_000) // 100% (scaled 10_000 = 100%)
+                        } else {
+                            U256::from(5_000) // 50%
+                        };
+                        let debt_to_cover = (debt * close_factor) / U256::from(10_000);
+
                         let opp = LiquidationOpportunity {
                             user,
                             collateral: Address::from_str("0x4200000000000000000000000000000000000006").unwrap(), // WETH Base
                             debt: Address::from_str("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913").unwrap(), // USDC Base
-                            debt_to_cover: debt, // 100% close factor if HF < 0.95
+                            debt_to_cover,
                             total_debt_base: debt,
                             health_factor: hf,
                         };
