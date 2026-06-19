@@ -2,7 +2,7 @@
 // Base L2 — Aave V3 — Balancer Flash Loans — Kaggle Optimized
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -40,11 +40,13 @@ async fn main() -> eyre::Result<()> {
     info!("Config loaded: chain_id={}, dry_run={}", config.chain_id, config.dry_run);
 
     // ── Load checkpoint (survives Kaggle 12h restart) ──
-    let checkpoint = BotCheckpoint::load(&config.checkpoint_path).await?;
+    let checkpoint = Arc::new(RwLock::new(BotCheckpoint::load(&config.checkpoint_path).await?));
+    let cp = checkpoint.read().await;
     info!(
         "📋 Checkpoint loaded: {} wins, ${:.2} total profit",
-        checkpoint.total_wins, checkpoint.total_profit_usd
+        cp.total_wins, cp.total_profit_usd
     );
+    drop(cp);
 
     // ── Initialize rotating RPC provider ──
     let rpc = Arc::new(RotatingProvider::new(config.rpc_urls.clone()).await?);
@@ -69,14 +71,11 @@ async fn main() -> eyre::Result<()> {
     ));
 
     // ── Graceful shutdown on Ctrl+C ──
+    let shutdown_cp = checkpoint.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         info!("🛑 Shutdown signal received — saving checkpoint...");
-        let mut cp = BotCheckpoint::default();
-        cp.last_run_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let cp = shutdown_cp.read().await.clone();
         let _ = cp.save(&config.checkpoint_path).await;
         std::process::exit(1);
     });

@@ -32,13 +32,13 @@ impl LiquidationMonitor {
         rpc: Arc<RotatingProvider>,
         tx: mpsc::Sender<LiquidationOpportunity>,
         config: Config,
-        mut checkpoint: BotCheckpoint,
+        checkpoint: Arc<tokio::sync::RwLock<BotCheckpoint>>,
     ) -> eyre::Result<()> {
         let _aave_pool = IAavePool::new(config.aave_pool, rpc.best_provider());
         let mut tick = interval(Duration::from_secs(config.poll_interval_secs));
 
         // Load or build watchlist
-        let watchlist = checkpoint.watchlist.clone();
+        let watchlist = checkpoint.read().await.watchlist.clone();
         let borrowers: Vec<Address> = if watchlist.is_empty() {
             // If no checkpoint, load from file or use empty (subgraph scraper should pre-fill)
             info!("Watchlist empty — bot will wait for watchlist.json to be populated");
@@ -107,11 +107,12 @@ impl LiquidationMonitor {
             }
 
             // Save checkpoint every 10 ticks (~100s)
-            checkpoint.last_run_timestamp = std::time::SystemTime::now()
+            let mut cp = checkpoint.write().await;
+            cp.last_run_timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if let Err(e) = checkpoint.save(&config.checkpoint_path).await {
+            if let Err(e) = cp.save(&config.checkpoint_path).await {
                 warn!("Failed to save checkpoint: {}", e);
             }
         }

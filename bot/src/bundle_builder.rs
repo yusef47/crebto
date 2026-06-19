@@ -1,13 +1,14 @@
 use std::str::FromStr;
 use alloy::{
-    network::TransactionBuilder,
-    primitives::Address,
-    rpc::types::eth::TransactionRequest,
+    consensus::{TxEip1559, TxEnvelope, SignableTransaction},
+    eips::eip2718::Encodable2718,
+    network::TxSigner,
+    providers::Provider,
     signers::local::PrivateKeySigner,
     sol_types::SolCall,
 };
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
 use crate::{
@@ -27,7 +28,7 @@ impl BundleBuilder {
         mut rx: mpsc::Receiver<LiquidationOpportunity>,
         rpc: Arc<RotatingProvider>,
         config: Config,
-        mut checkpoint: BotCheckpoint,
+        checkpoint: Arc<RwLock<BotCheckpoint>>,
     ) -> eyre::Result<()> {
         let mev_executor = config.executor_address;
         let aave_pool = config.aave_pool;
@@ -63,46 +64,61 @@ impl BundleBuilder {
 
             if config.dry_run {
                 info!("🚫 DRY_RUN=true — bundle NOT submitted");
-                checkpoint.total_wins += 1;
-                checkpoint.total_profit_usd += 100.0; // placeholder
-                if let Err(e) = checkpoint.save(&config.checkpoint_path).await {
+                let mut cp = checkpoint.write().await;
+                cp.total_wins += 1;
+                cp.total_profit_usd += 100.0; // placeholder
+                if let Err(e) = cp.save(&config.checkpoint_path).await {
                     warn!("Failed to save checkpoint: {}", e);
                 }
                 continue;
             }
 
-            // Step 2: Build and sign transaction
-            let Some(ref _s) = signer else {
+            // Step 2: Build transaction
+            let Some(ref s) = signer else {
                 warn!("No private key configured, cannot submit live bundles");
                 continue;
             };
 
-            let tx_req = TransactionRequest::default()
-                .with_to(mev_executor)
-                .input(
-                    IMEVExecutor::executeLiquidationBalancerCall {
-                        aavePool: aave_pool,
-                        collateral: opp.collateral,
-                        debt: opp.debt,
-                        user: opp.user,
-                        debtToCover: opp.debt_to_cover,
-                        flashAmount: opp.debt_to_cover,
-                    }
-                    .abi_encode()
-                    .into(),
-                )
-                .with_gas_limit(config.max_gas.into())
-                .with_max_fee_per_gas((config.gas_price_wei * 2).into());
+            let call_data = IMEVExecutor::executeLiquidationBalancerCall {
+                aavePool: aave_pool,
+                collateral: opp.collateral,
+                debt: opp.debt,
+                user: opp.user,
+                debtToCover: opp.debt_to_cover,
+                flashAmount: opp.debt_to_cover,
+            }
+            .abi_encode();
 
-            // Step 3: Sign and encode
-            // Note: In a real implementation, use alloy's signer middleware
-            // For brevity, this is a simplified representation
-            let signed_tx = vec![0u8; 32]; // PLACEHOLDER — real signing requires chain-specific nonce management
+            // Fetch nonce and block number from chain
+            let nonce = best_provider
+                .get_transaction_count(s.address())
+                .await
+                .unwrap_or(1);
+            let block_target = best_provider
+                .get_block_number()
+                .await
+                .unwrap_or(0)
+                + 1;
+
+            let mut tx = TxEip1559 {
+                to: mev_executor.into(),
+                input: alloy::primitives::Bytes::from(call_data),
+                gas_limit: config.max_gas as u128,
+                max_fee_per_gas: (config.gas_price_wei * 2) as u128,
+                chain_id: config.chain_id,
+                nonce,
+                ..Default::default()
+            };
+
+            let sig = s.sign_transaction(&mut tx).await?;
+            let signed = tx.into_signed(sig);
+            let envelope: TxEnvelope = signed.into();
+            let signed_tx = envelope.encoded_2718();
 
             let bundle = MevBundle {
                 signed_txs: vec![signed_tx],
-                block_target: 0, // Filled by calling best_provider.get_block_number().await + 1
-                refund_address: Address::from_str("0x0000000000000000000000000000000000000000").unwrap(),
+                block_target,
+                refund_address: s.address(),
                 refund_percent: 100,
             };
 
