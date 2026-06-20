@@ -90,16 +90,18 @@ def find_working_rpc():
 
 def fetch_borrow_events(rpc_url, from_block, to_block):
     """Fetch Borrow events from the Aave Pool in a block range."""
+    # Request ALL logs from Aave Pool (no topic filter) — some free RPCs
+    # silently fail on eth_getLogs with topic filters
     params = [{
         "address": AAVE_POOL,
         "fromBlock": hex(from_block),
         "toBlock": hex(to_block),
-        "topics": [BORROW_EVENT_SIG]
     }]
     logs = rpc_call(rpc_url, "eth_getLogs", params)
     if logs is None:
         return []
-    return logs
+    # Filter by Borrow event signature in Python
+    return [log for log in logs if log.get("topics") and log["topics"][0] == BORROW_EVENT_SIG]
 
 
 def encode_get_account_data(user_address):
