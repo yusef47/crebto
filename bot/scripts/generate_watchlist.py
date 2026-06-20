@@ -177,7 +177,13 @@ def main():
     addresses = generate_watchlist(args.min, args.max, args.limit)
 
     if not addresses:
-        print("No borrowers found in range. Try widening the debt thresholds.", file=sys.stderr)
+        print(
+            "\n❌ No borrowers found. Possible causes:\n"
+            "  1. All subgraph endpoints failed. Set GRAPH_API_KEY env var\n"
+            "     for The Graph decentralized network (get free key at https://thegraph.com/studio/)\n"
+            "  2. No borrowers match the debt range. Try widening --min and --max.\n",
+            file=sys.stderr
+        )
         sys.exit(1)
 
     # Save as simple array of addresses (the bot expects this format)

@@ -74,9 +74,9 @@ impl BundleBuilder {
             );
 
             if config.dry_run {
-                // Estimate gas cost for reporting
+                // Estimate gas cost for reporting (rough ETH price $3,000 — Phase 0 placeholder)
                 let gas_cost_eth = (config.max_gas as f64 * config.gas_price_wei as f64) / 1e18;
-                let gas_cost_usd = gas_cost_eth * 3000.0; // rough ETH price
+                let gas_cost_usd = gas_cost_eth * 3000.0;
                 info!(
                     "🚫 DRY_RUN | Would broadcast liquidation for user={:?}\n  ├─ collateral: {:?}\n  ├─ debt: {:?}\n  ├─ debt_to_cover: {}\n  ├─ flash_amount: {}\n  ├─ min_amount_out: {}\n  ├─ max_gas: {}\n  ├─ gas_price: {} gwei\n  └─ estimated_gas_cost: ${:.2}",
                     opp.user,

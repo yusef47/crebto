@@ -177,12 +177,11 @@ impl LiquidationMonitor {
                             health_factor: hf,
                         };
 
-                        candidates_found += 1;
-
                         if tx.send(opp).await.is_err() {
                             warn!("Liquidation channel closed");
                             return Ok(());
                         }
+                        candidates_found += 1;
                     }
                 }
             }
