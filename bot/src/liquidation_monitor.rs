@@ -36,17 +36,40 @@ impl LiquidationMonitor {
         let _aave_pool = IAavePool::new(config.aave_pool, rpc.best_provider());
         let mut tick = interval(Duration::from_secs(config.poll_interval_secs));
 
-        // Load or build watchlist
-        let watchlist = checkpoint.read().await.watchlist.clone();
-        let borrowers: Vec<Address> = if watchlist.is_empty() {
-            // If no checkpoint, load from file or use empty (subgraph scraper should pre-fill)
-            info!("Watchlist empty — bot will wait for watchlist.json to be populated");
-            vec![]
-        } else {
-            watchlist.iter()
+        // Load watchlist: checkpoint first, then fallback to watchlist.json file
+        let mut borrowers: Vec<Address> = {
+            let cp = checkpoint.read().await;
+            cp.watchlist.iter()
                 .filter_map(|s| s.parse::<Address>().ok())
                 .collect()
         };
+
+        if borrowers.is_empty() {
+            info!("Checkpoint watchlist empty — attempting to load from {}", config.watchlist_path);
+            match tokio::fs::read_to_string(&config.watchlist_path).await {
+                Ok(json) => {
+                    if let Ok(addresses) = serde_json::from_str::<Vec<String>>(&json) {
+                        borrowers = addresses.iter()
+                            .filter_map(|s| s.parse::<Address>().ok())
+                            .collect();
+                        if borrowers.is_empty() {
+                            warn!("Watchlist file {} parsed but contains 0 valid addresses", config.watchlist_path);
+                        } else {
+                            info!("Loaded {} borrowers from {}", borrowers.len(), config.watchlist_path);
+                        }
+                        // Persist to checkpoint so next restart uses it
+                        let mut cp = checkpoint.write().await;
+                        cp.watchlist = addresses;
+                        let _ = cp.save(&config.checkpoint_path).await;
+                    } else {
+                        warn!("Failed to parse watchlist JSON from {}", config.watchlist_path);
+                    }
+                }
+                Err(e) => {
+                    warn!("No watchlist file found at {}: {}", config.watchlist_path, e);
+                }
+            }
+        }
 
         if borrowers.is_empty() {
             warn!("No borrowers in watchlist. Bot will idle and retry every 60s. Populate watchlist.json to start scanning.");
