@@ -25,6 +25,8 @@ sol! {
             uint256 healthFactor
         );
 
+        function getUserReservesList(address user) external view returns (address[] memory);
+
         function getUserReserveData(address asset, address user) external view returns (
             uint256 currentATokenBalance,
             uint256 currentStableDebt,
