@@ -32,6 +32,7 @@ where
         user,
         debtToCover: debt_to_cover,
         flashAmount: flash_amount,
+        minAmountOut: U256::ZERO,
     }
     .abi_encode();
 

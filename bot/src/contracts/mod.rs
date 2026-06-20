@@ -9,7 +9,8 @@ sol! {
             address debt,
             address user,
             uint256 debtToCover,
-            uint256 flashAmount
+            uint256 flashAmount,
+            uint256 minAmountOut
         ) external;
     }
 

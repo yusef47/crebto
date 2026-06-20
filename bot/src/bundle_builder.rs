@@ -3,6 +3,7 @@ use alloy::{
     consensus::{TxEip1559, TxEnvelope, SignableTransaction},
     eips::eip2718::Encodable2718,
     network::TxSigner,
+    primitives::U256,
     providers::Provider,
     signers::local::PrivateKeySigner,
     sol_types::SolCall,
@@ -85,6 +86,7 @@ impl BundleBuilder {
                 user: opp.user,
                 debtToCover: opp.debt_to_cover,
                 flashAmount: opp.debt_to_cover,
+                minAmountOut: U256::ZERO, // Phase 0: accept any output; bot will calc off-chain in Phase 1
             }
             .abi_encode();
 
