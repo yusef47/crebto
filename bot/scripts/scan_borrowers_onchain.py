@@ -134,7 +134,7 @@ def get_user_account_data(rpc_url, user):
         return None
 
 
-def scan_borrowers(min_debt_usd, max_debt_usd, limit, rpc_url):
+def scan_borrowers(min_debt_usd, max_debt_usd, limit, rpc_url, scan_blocks=100000):
     """Scan Borrow events, discover active borrowers, filter by debt."""
     current_block_hex = rpc_call(rpc_url, "eth_blockNumber", [])
     if not current_block_hex:
@@ -143,9 +143,8 @@ def scan_borrowers(min_debt_usd, max_debt_usd, limit, rpc_url):
     current_block = int(current_block_hex, 16)
     print(f"Current block: {current_block}")
 
-    scan_blocks = 2000
     from_block = max(current_block - scan_blocks, 0)
-    print(f"Scanning Borrow events from block {from_block} to {current_block}...")
+    print(f"Scanning Borrow events from block {from_block} to {current_block} ({scan_blocks:,} blocks)...")
 
     batch_size = 500
     all_users = set()
@@ -201,6 +200,7 @@ def main():
     parser.add_argument("--min", type=float, default=1000, help="Minimum debt USD")
     parser.add_argument("--max", type=float, default=5000, help="Maximum debt USD")
     parser.add_argument("--limit", type=int, default=300, help="Max borrowers")
+    parser.add_argument("--blocks", type=int, default=100000, help="Blocks to scan")
     parser.add_argument("--output", type=str, default="/kaggle/working/watchlist.json")
     args = parser.parse_args()
 
@@ -214,7 +214,7 @@ def main():
         sys.exit(1)
 
     print()
-    addresses = scan_borrowers(args.min, args.max, args.limit, rpc_url)
+    addresses = scan_borrowers(args.min, args.max, args.limit, rpc_url, args.blocks)
 
     if not addresses:
         print()
