@@ -40,10 +40,14 @@ impl BundleBuilder {
         };
 
         while let Some(opp) = rx.recv().await {
-            info!("📦 Building bundle for liquidation: user={:?}", opp.user);
+            info!(
+                "📦 Opportunity received | user={:?} | collateral={:?} | debt={:?} | debt_to_cover={} | hf={}",
+                opp.user, opp.collateral, opp.debt, opp.debt_to_cover, opp.health_factor
+            );
 
             // Step 1: Simulate via eth_call + StateOverride
             let best_provider = rpc.best_provider_owned();
+            let sim_start = std::time::Instant::now();
             let simulation_passed = simulate_liquidation(
                 &best_provider,
                 mev_executor,
@@ -54,19 +58,41 @@ impl BundleBuilder {
                 opp.debt_to_cover,
                 opp.debt_to_cover, // flashAmount = debtToCover for simplicity
             ).await.unwrap_or(false);
+            let sim_elapsed = sim_start.elapsed().as_millis();
 
             if !simulation_passed {
-                warn!("❌ Simulation failed for user={:?}, skipping", opp.user);
+                warn!(
+                    "❌ Simulation FAILED | user={:?} | collateral={:?} | debt={:?} | sim_time={}ms | skipping",
+                    opp.user, opp.collateral, opp.debt, sim_elapsed
+                );
                 continue;
             }
 
-            info!("✅ Simulation passed for user={:?}", opp.user);
+            info!(
+                "✅ Simulation PASSED | user={:?} | sim_time={}ms",
+                opp.user, sim_elapsed
+            );
 
             if config.dry_run {
-                info!("🚫 DRY_RUN=true — bundle NOT submitted");
+                // Estimate gas cost for reporting
+                let gas_cost_eth = (config.max_gas as f64 * config.gas_price_wei as f64) / 1e18;
+                let gas_cost_usd = gas_cost_eth * 3000.0; // rough ETH price
+                info!(
+                    "🚫 DRY_RUN | Would broadcast liquidation for user={:?}\n  ├─ collateral: {:?}\n  ├─ debt: {:?}\n  ├─ debt_to_cover: {}\n  ├─ flash_amount: {}\n  ├─ min_amount_out: {}\n  ├─ max_gas: {}\n  ├─ gas_price: {} gwei\n  └─ estimated_gas_cost: ${:.2}",
+                    opp.user,
+                    opp.collateral,
+                    opp.debt,
+                    opp.debt_to_cover,
+                    opp.debt_to_cover,
+                    U256::ZERO,
+                    config.max_gas,
+                    config.gas_price_wei / 1_000_000_000,
+                    gas_cost_usd
+                );
                 let mut cp = checkpoint.write().await;
                 cp.total_wins += 1;
-                cp.total_profit_usd += 100.0; // placeholder
+                // Phase 0: profit placeholder until real profit estimation is implemented
+                cp.total_profit_usd += 0.0;
                 if let Err(e) = cp.save(&config.checkpoint_path).await {
                     warn!("Failed to save checkpoint: {}", e);
                 }
@@ -126,10 +152,21 @@ impl BundleBuilder {
             // Broadcast directly to Base mempool (MEV-Share does not exist on Base)
             match best_provider.send_raw_transaction(signed_tx.as_slice()).await {
                 Ok(pending_tx) => {
-                    info!("✅ Transaction broadcasted! TX Hash: {:?}", pending_tx.tx_hash());
+                    info!(
+                        "✅ Transaction BROADCASTED | user={:?} | tx_hash={:?} | nonce={} | block_target={}",
+                        opp.user, pending_tx.tx_hash(), nonce, block_target
+                    );
+                    let mut cp = checkpoint.write().await;
+                    cp.total_wins += 1;
+                    if let Err(e) = cp.save(&config.checkpoint_path).await {
+                        warn!("Failed to save checkpoint: {}", e);
+                    }
                 }
                 Err(e) => {
-                    warn!("❌ Transaction submission failed: {}", e);
+                    warn!(
+                        "❌ Transaction BROADCAST FAILED | user={:?} | nonce={} | error={}",
+                        opp.user, nonce, e
+                    );
                 }
             }
         }

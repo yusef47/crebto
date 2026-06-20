@@ -61,6 +61,9 @@ impl LiquidationMonitor {
 
         loop {
             tick.tick().await;
+            let poll_start = std::time::Instant::now();
+            let mut scanned = 0usize;
+            let mut candidates_found = 0usize;
 
             // Batch multicall for health factors
             let batches = borrowers.chunks(config.multicall_batch_size);
@@ -74,6 +77,7 @@ impl LiquidationMonitor {
                         Err(_) => {}
                     }
                 }
+                scanned += batch.len();
 
                 for (user, result) in results {
                     let hf = result.healthFactor;
@@ -173,6 +177,8 @@ impl LiquidationMonitor {
                             health_factor: hf,
                         };
 
+                        candidates_found += 1;
+
                         if tx.send(opp).await.is_err() {
                             warn!("Liquidation channel closed");
                             return Ok(());
@@ -180,6 +186,12 @@ impl LiquidationMonitor {
                     }
                 }
             }
+
+            let elapsed = poll_start.elapsed().as_millis();
+            info!(
+                "📊 Poll complete: {} borrowers scanned, {} candidates found, {}ms elapsed",
+                scanned, candidates_found, elapsed
+            );
 
             // Save checkpoint every 10 ticks (~100s)
             let mut cp = checkpoint.write().await;
